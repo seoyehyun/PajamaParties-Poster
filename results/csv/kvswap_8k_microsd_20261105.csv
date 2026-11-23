@@ -1,5 +1,0 @@
-run,tag,mode,mem,G,M,prefetch,io,depth,exit,prompt_tps,decode_tps,tpot_ms,n_decode,majflt,max_rss_mb,kv_read_mb,kv_reads,kv_write_mb,io_stall_s,kv_write_s,kv_resident_mb,io_r_s,io_rkB_s,io_r_await_ms,io_util_pct,iowait_pct,temp_end_c
-B0_base_r1,B0_base,base,none,,,,none,,0,10.11,11.48,87.14,63,148,3042.09,,,,,,,1.67,62.67,1.83,0.87,0.04,52
-B1_file_r1,B1_file,file,none,,,,direct,1,0,9.43,0.03,28634.69,15,145,2971.74,12743.50,13440,825.10,425.92,67.38,28.90,250.83,28540.90,4.31,95.57,46.28,42
-B2_sel_g8_pf0_r1,B2_sel_g8_pf0,select,none,8,50,0,direct,1,0,9.34,0.34,2915.24,63,139,2971.58,2912,175616,830.40,154.53,62.57,28.70,941.89,15986.94,0.97,93.16,32.81,43
-B2_sel_g8_pf1_r1,B2_sel_g8_pf1,select,none,8,50,1,direct,1,0,9.42,0.35,2843.24,63,145,2971.74,2912,175616,830.40,151.37,55.60,28.70,967.65,16430.62,0.95,93.09,33.25,44

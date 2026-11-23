@@ -1,85 +1,143 @@
 # Optimizing Cross-Resource Coordination for Thermal-Aware On-device LLM Inference
 
-**파자마파티즈** (김휘영, 김지호, 서예현, 임예랑)
-- 연세대학교 컴퓨터종합설계 2026-2
-- 지도: 정진규 교수님, 하승원 조교님
+연세대학교 컴퓨터종합설계 2026-2
 
-## 연구 요약
+파자마파티즈 — 김휘영, 김지호, 서예현, 임예랑
 
-- 배경: 온디바이스 LLM 추론 시 CPU, GPU, NPU가 공유 메모리를 두고 경쟁
-- 대상: Orange Pi 6 Plus (CIX P1)
-- 측정: 자원별 주파수와 KV cache 오프로딩(KV를 NVMe로 내림)이 속도와 발열에 미치는 영향
-- 결과: 속도 제약을 지키면서 발열이 가장 낮은 운용 조건 도출
+지도: 정진규 교수님, 하승원 조교님
 
-## 핵심 결과
+본 저장소는 **온디바이스 LLM의 자원 상호작용과 발열 관리에 관한 실험 설명, 측정 데이터 및 실행 코드**를 제공한다. 본 연구는 온디바이스 LLM 추론에서 CPU·GPU·NPU의 자원 간 상호작용을 분석하고, KV cache 오프로딩과 단계별 주파수 조절을 결합하여 **요구 성능을 만족하면서 발열을 최소화하는 운용 조건**을 도출하였다.
 
-- 포스터 Figure 번호와 대응
-- 수치와 조건은 오른쪽 상세 문서 참조
-
-| | 결과 | 상세 |
-|---|---|---|
-| **Fig. 1** 주파수 민감도 | - prefill: CPU, GPU, NPU 모두 주파수에 거의 비례<br>- decode: CPU는 약 1.5 GHz 이후 포화(메모리 읽기 약 39~44 GB/s), GPU는 거의 비례, NPU는 둔감<br>- NPU: 주파수 3배에 prefill 2.49배, decode 1.56배 | [cpu-gpu-memory-sweeps](results/docs/cpu-gpu-memory-sweeps-20261113.md), [results-20261121](results/docs/results-20261121.md) 4-1절 |
-| **Fig. 2** 자원 간 상호작용 | - 단독 실행: 자원 간 독립<br>- 동시 실행 decode: CPU 주파수 상승 시 GPU 최대 **+74.6%** 느려짐<br>- 동시 실행 prefill: 모든 조합에서 간섭 0.5% 이내<br>- NPU: CPU와 동시 실행 시 최대 +16.6% 느려짐(원인은 NPU가 아닌 호스트 쪽 메모리 경합), GPU와는 간섭 거의 없음 | [results-20261121](results/docs/results-20261121.md) 4~5절 |
-| **Fig. 3** KV 오프로딩 | - CPU DRAM 읽기 약 절반으로 감소(39~44 → 20~26 GB/s)<br>- decode 속도 동일하거나 최대 11% 향상(2.2 GHz에서 73.6 → 65.6 ms/token)<br>- 동시 실행 GPU 슬로다운: 컨텍스트가 길수록 감소 폭 증가, 11K에서 **+87% → +17%**(3K +43 → +24%, 7K +64 → +19%) | [results-20261121](results/docs/results-20261121.md) 1, 6절, [corun-kvswap-ctx](results/docs/corun-kvswap-ctx-20261119.md) |
-| **Fig. 4** 발열 | - CPU 전용: decode만 1.5 GHz로 낮추면 TTFT 유지, 열 면적 12.6% 감소<br>- CPU+GPU 동시 실행: **KV 오프로딩 + decode 1.5 GHz**로 속도 제약 유지, 열 면적 **19%** 감소(CPU 작업 TPOT 0.97배, GPU 작업 0.79배, TTFT 1.05배) | [thermal-ab-phase](results/docs/thermal-ab-phase-20261114.md), [results-20261121](results/docs/results-20261121.md) 3절 |
-| **동적 관리** | - 사전 계산 테이블을 실행 중에 적용하는 `governor-lite` 구현<br>- CPU 단계(prefill, decode)와 GPU 작업을 감지해 A720 주파수 전환<br>- 같은 작업량의 고정 설정(decode 1.5 GHz)과 동일한 결과<br>- KV 오프로딩만 사용 시 대비 첫 토큰 이후 열 36% 감소 | [governor-lite](results/docs/governor-lite.md), [precomputed-table](results/docs/precomputed-table.md) |
-
-**부가 결과**
-- 대상: 작은 모델(Qwen2.5-0.5B)
-- 컨텍스트 256토큰: KV 오프로딩 손해(TPOT 1.13배)
-- 컨텍스트 4K: TPOT 0.88배, 16K: 0.43배
-- 손익분기점: 256과 4K 사이
-- 상세: [results-20261121](results/docs/results-20261121.md) 6b절
+CPU·GPU 동시 실행에서 **KV 오프로딩 + decode 1.5 GHz 적용 시 요청 전체 열 면적이 약 19% 감소하였다.** 이때 CPU TPOT은 기준선의 0.97배, GPU TPOT은 0.79배, TTFT는 1.05배였다.
 
 ## 저장소 구성
 
-| 폴더 | 내용 |
+| 문서 | 내용 |
 |---|---|
-| [results/](results/) | - 상세 실험 결과<br>- 문서: `results/docs/`, 요약 CSV와 그림: `results/csv/`<br>- 색인: [results/README.md](results/README.md) |
-| [code/](code/) | - 실험·분석 스크립트<br>- llama.cpp용 KV 오프로딩 패치 01~05<br>- 사용법: [code/README.md](code/README.md) |
+| [실험 결과 및 분석](results/README.md) | 주파수 민감도, 자원 간 간섭, KV 오프로딩 및 성능·발열 비교 |
+| [실험 코드 및 재현 절차](code/README.md) | 실행 환경, 실험 스크립트 및 재현 명령 |
+| [선행 연구](related-work.md) | 주요 기반 연구, 관련 연구 및 본 연구와의 연계 |
 
-## 실험 환경
+[실험 코드 및 재현 절차](code/README.md)는 환경 구성과 실험별 실행 명령을, [선행 연구](related-work.md)는 CRAVE·EnerInfer·KVSwap과 본 연구의 관계를 기술한다.
 
-| 항목 | 내용 |
+## 연구 배경
+
+소형 기기는 냉각 성능이 제한적이므로 지속적인 LLM 추론에서 발열 관리가 요구된다. 실험 보드의 CPU·GPU·NPU는 주 메모리(DRAM)를 공유하므로, 특정 장치의 주파수 변화가 다른 장치의 성능에도 영향을 미친다. 긴 문맥에서는 KV cache 읽기량이 증가하여 메모리 대역폭 병목이 심화될 수 있다.
+
+## 사전 지식
+
+**KV cache**는 이전 문맥의 중간 계산 결과를 저장한 자료구조이다. 모델은 토큰 생성 시 KV cache를 참조하며, 문맥 내 각 위치의 참조 가중치를 계산하는 과정을 **어텐션**(attention)이라고 한다.
+
+LLM 추론은 다음 두 단계로 구분한다.
+
+| 단계 | 처리 내용 | 분석 항목 |
+|---|---|---|
+| **Prefill — 입력 처리** | 입력 문맥을 일괄 처리하고 첫 토큰 생성을 준비한다. | 주파수 변화에 따른 첫 토큰 지연 |
+| **Decode — 답변 생성** | 이전 문맥을 참조하여 토큰을 순차 생성한다. 토큰은 모델의 텍스트 처리 단위이다. | 연산·메모리 병목 및 동시 실행 간섭 |
+
+본 연구는 **KV cache 접근 방식에 따른 병목 및 자원 간 간섭의 변화**를 규명하고, 이를 반영한 주파수 운용 조건을 분석한다.
+
+## 연구 방법
+
+1. **자원 상호작용 분석:** CPU·GPU·NPU의 주파수를 바꾸며 단독·동시 실행의 성능을 측정하였다. Prefill과 decode를 나누고, 슬로다운과 RI(Resource Interaction) 행렬로 관계를 정량화하였다.
+2. **KV cache 오프로딩 분석:** KVSwap을 llama.cpp에 단순화해 구현하였다. 전체 KV는 NVMe SSD에 보관하고, 저랭크 키 예측기로 필요한 그룹을 선택하여 direct I/O로 읽으며 최근 읽은 KV를 재사용한다. RAM에 전체 KV를 두는 설정과 속도·읽기량·간섭을 비교하였다.
+3. **단계 인식 주파수 관리:** 지배 자원과 KV 위치별로 측정한 설정 중 속도 조건을 만족하면서 열 면적이 낮은 주파수를 표로 정리하였다. 이를 검증하고 `governor-lite`가 실행 중 자동으로 적용하도록 하였다.
+
+**동시 실행은 별도 CPU·GPU·NPU 추론 요청을 함께 실행하는 구성이다.** 하나의 모델을 여러 장치에 나누어 처리하는 구성과 구분한다. KV 오프로딩은 CPU 작업에 적용하고, 함께 실행하는 GPU 작업은 별도 프로세스에서 처리하였다. 코드의 `KV swap`·`swap`은 이 오프로딩 구현을 의미한다.
+
+## 연구 결과
+
+### Prefill과 decode의 주파수 민감도
+
+Prefill 처리 속도는 CPU·GPU·NPU 모두 주파수에 거의 비례하여 증가하였다. Decode는 CPU에서 **약 1.5 GHz 이후 포화**되었으며, GPU는 주파수에 대한 높은 민감도, NPU는 상대적으로 낮은 민감도를 보였다.
+
+각 곡선은 자원별 최대 주파수와 해당 주파수에서의 처리 속도를 기준으로 정규화하였다. CPU·GPU와 NPU의 모델이 다르므로 장치 간 절대 성능 비교에는 사용하지 않는다. [측정 조건과 원본 CSV](results/README.md#frequency-sensitivity)
+
+### Decode 동시 실행의 자원 간 간섭
+
+단독 실행에서는 다른 장치의 주파수 영향이 작았지만, decode 동시 실행에서는 CPU 주파수를 높일수록 GPU·NPU 성능이 떨어졌다. 측정한 조합에서 슬로다운은 GPU 최대 **+74.6%**, NPU 최대 **+16.6%**였다. CPU·GPU prefill 동시 실행의 간섭은 4×4 주파수 조합에서 **0.5% 이내**였다.
+
+RI 행렬은 **CPU·GPU·NPU의 3×3 관계**를 표시한다. 셀 값은 주파수 변화에 대한 성능 변화의 로그 기울기이며, `n/m`은 미측정 칸이다. 4×4 주파수 조합 실험과 RI 행렬의 크기는 서로 다른 의미다. [RI 행렬 정의 및 측정 근거](results/README.md#resource-interaction)
+
+### KV 오프로딩에 따른 병목 및 간섭 완화
+
+7K 입력의 CPU 실험에서 오프로딩 적용 시 **CPU 메모리 읽기량이 약 40~50% 감소하였다.** Decode 시간은 유지되거나 감소하였으며, CPU 2.2 GHz에서는 **73.6 → 65.6 ms/token**, 약 11% 단축되었다. 읽기량 감소와 주파수 반응의 변화는 병목이 메모리 대역폭에서 연산 쪽으로 이동하였다는 해석을 지지한다.
+
+CPU 1.5 GHz·GPU 1 GHz 동시 실행에서는 CPU 문맥이 길수록 GPU 간섭 감소 폭이 커졌다.
+
+| CPU 입력 문맥 | RAM KV의 GPU 슬로다운 | 오프로딩 후 GPU 슬로다운 |
+|---|---:|---:|
+| 약 3K | +43% | +24% |
+| 약 7K | +64% | +19% |
+| 약 11K | **+87%** | **+17%** |
+
+11K 문맥에서 CPU 단독 구간의 TPOT은 **101.1 → 87.75 ms/token**으로 약 13% 감소하였다. 3K에서는 동일 지표가 약 22% 증가하여, 문맥 길이에 따른 적용 효과의 차이를 확인하였다. [구간별 비교와 근거](results/README.md#kv-offloading)
+
+### 단계별 주파수 제어의 성능·발열 비교
+
+요청 전체의 CPU 주파수 제한은 열 면적을 감소시키지만 첫 토큰 지연을 증가시킨다. 이에 prefill은 기본 정책으로 유지하고 **decode에만 1.5 GHz**를 적용하였다.
+
+| 실행 구성 | 변경한 설정 | TTFT | CPU TPOT | GPU TPOT | 요청 전체 열 면적 |
+|---|---|---:|---:|---:|---:|
+| CPU 단독 | Decode만 CPU 1.5 GHz, RAM KV | 1.00배 | 1.05배 | 해당 없음 | **0.874배 — 12.6% 감소** |
+| CPU·GPU 동시 | KV 오프로딩 + decode CPU 1.5 GHz, GPU 1 GHz | 1.05배 | 0.97배 | 0.79배 | **0.81배 — 약 19% 감소** |
+
+각 행의 비율은 해당 실행 구성의 **RAM KV·기본 주파수 정책**을 기준으로 한다. 동시 실행의 TTFT는 CPU 작업 기준이다. 두 설정 모두 TTFT와 각 작업의 TPOT이 기준선의 1.10배 이내였다. 동시 실행의 첫 토큰 이후 열 면적은 기준선의 0.55배였다. [설정별 결과 및 측정 조건](results/README.md#thermal-latency)
+
+### Governor-lite — 단계 인식 주파수 관리
+
+`governor-lite`는 0.5초마다 CPU prefill/decode와 GPU 활동 상태를 감지하고, 테이블에 따라 A720 주파수를 바꾼다. 최종 규칙에서 KV 오프로딩의 prefill은 기본 정책, decode는 1.5 GHz이다.
+
+**KV 오프로딩 단독 적용 설정 대비** TTFT는 유지되었으며, **첫 토큰 이후 열 면적은 약 36%**, GPU TPOT은 약 10% 감소하였다. CPU TPOT은 약 16% 증가하였다. 이 16%는 KV 오프로딩만 사용한 설정 대비 증가이며, RAM 기준선 대비 CPU TPOT은 약 0.83배였다. 동일 작업량에서 단계별 고정 설정인 “decode 1.5 GHz”와 유사한 결과를 자동 적용으로 재현하였다.
+
+동시 실행 실험의 **19%**는 RAM 기준선 대비 **요청 전체** 열 감소이고, **36%**는 KV 오프로딩 단독 적용 설정 대비 **첫 토큰 이후** 열 감소다. 작업 구성도 다르므로 같은 기준의 수치로 비교하지 않는다. [동작과 비교표](results/README.md#governor-lite)
+
+## 평가 지표 및 실험 환경
+
+| 지표 | 의미 |
 |---|---|
-| 보드 | Orange Pi 6 Plus (CIX P1: A720 ×8 + A520 ×4, Mali GPU, NPU), RAM 31.7 GB, 커널 6.6.89-cix |
-| 추론 엔진 | - CPU, GPU: llama.cpp (GPU는 Vulkan, `-ngl 99`)<br>- NPU: CIX NOE (`.cix`) |
-| 모델 | - CPU, GPU: Qwen3-1.7B Q4_K_M<br>- NPU: Qwen2.5-0.5B int8<br>- NPU는 모델이 달라 자기 단독 실행 대비 비율로만 비교 |
-| KV 오프로딩 | - KVSwap을 단순화해 llama.cpp에 구현<br>- 저랭크 키 예측기로 고른 KV 그룹만 NVMe에서 direct I/O로 읽음<br>- 패치: [code/patches/](code/patches/) |
-| 측정 | TTFT(prefill 시간), TPOT, DRAM 읽기 대역폭(A720 PMU `l2d_cache_refill`), 온도, **열 면적**(온도 상승 × 시간) |
+| **TTFT — Time to First Token** | 첫 토큰 대기 시간. 이 실험은 엔진의 prefill 시간을 대리값으로 사용한다. |
+| **TPOT — Time per Output Token** | Decode에서 토큰 하나를 생성하는 데 걸린 평균 시간. 낮을수록 처리 속도가 높다. |
+| **슬로다운** | `동시 실행 TPOT ÷ 같은 주파수의 단독 실행 TPOT − 1`. +20%는 단독 실행 대비 처리 시간 1.20배를 의미한다. |
+| **열 면적 — Heat area** | 실행 전보다 높아진 온도를 시간에 따라 누적한 값. 보통 생성 토큰 수로 나누며, 종료 후 냉각도 포함한다. |
+| **CPU 메모리 읽기량** | A720 성능 카운터로 추정한 DRAM 읽기 대역폭. GPU·NPU 트래픽까지 합친 값은 아니다. |
 
-**"최적"의 기준**
-- 전력 센서 부재로 에너지 직접 측정 불가
-- 대리 지표: 열 면적 (가장 뜨거운 열 존의 온도 상승을 식는 꼬리까지 시간 적분)
-- 조건: TPOT, TTFT가 기준선의 1.10배 이내, 품질 0.93 이상
-- 최적: 조건을 만족하는 설정 중 열 면적 최소
+기준 온도 대비 10 °C의 상승이 60초간 유지되는 경우 열 면적은 600 °C·s이다. 열 면적은 온도 기반 대리 지표이므로 감소율을 에너지 절감률로 해석하지 않는다.
 
-## 재현
+| 항목 | 실험 환경 |
+|---|---|
+| 플랫폼 | Orange Pi 6 Plus, CIX P1: Cortex-A720 8코어 + A520 4코어, Mali GPU, NPU |
+| 메모리·커널 | RAM 31.7 GB, Linux 6.6.89-cix |
+| CPU·GPU | llama.cpp, Qwen3-1.7B Q4_K_M. GPU는 Vulkan 빌드 사용 |
+| NPU | CIX NOE, Qwen2.5-0.5B int8 `.cix` 모델 |
+| KV 오프로딩 | llama.cpp CPU 경로의 KVSwap 단순화 구현, NVMe direct I/O |
 
-- 필요: 보드(Orange Pi 6 Plus), llama.cpp 빌드
-  - 커밋 `931351ea5` (빌드 b11278)
-  - 옵션 `-DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv9.2-a+i8mm+bf16+dotprod+fp16`
-- 패치 적용 순서와 실행 명령: [code/README.md](code/README.md)
-- 저장소 미포함: 모델 파일, 보드 접속 정보
+<a id="research-progress"></a>
 
-## 한계
+## 연구 진행 경과
 
-- 반복 횟수: 대부분 1~2회 (`results-20261121`의 값은 n=1)
-- 노이즈 폭: 열 면적 판정 최소 5%, 요청 전체 열 면적 차이가 작은 칸은 노이즈 범위 내
-- 열 면적은 에너지가 아닌 대리 지표
-- 열 존 온도 해상도 1 °C로 NPU 발열 측정 불가
-- 측정 범위 제한: 모델 1개(Qwen3-1.7B), 컨텍스트 일부, GPU·A720 주파수 일부 점
-- NPU는 다른 모델(0.5B)
-- KV 오프로딩 제약
-  - CPU 프로세스에만 구현
-  - GPU와 한 프로세스에서 사용 시 세그폴트
-  - 3K 이하 짧은 컨텍스트에서는 이득 없음 또는 손해
-- 품질(0.945): NIAH 점검 값을 판정에 입력, 전 설정 재측정 아님
-- 메모리 주파수 직접 변경 불가: 메모리 축은 PMU 대역폭으로 간접 확인
+연구는 중간발표의 **에너지 효율과 자원 상호작용 분석**을 기반으로 진행되었으며, 후속 실험에서 **성능·발열 지표와 단계별 운용 조건**을 구체화하였다.
 
-## 선행 연구
+| 항목 | 중간보고서·중간발표 | 본 저장소의 실험 및 구현 |
+|---|---|---|
+| 실험 플랫폼 | Firefly ROC-RK3588S-PC, RK3588S | Orange Pi 6 Plus, CIX P1 |
+| 엔진·초기 모델 | llama.cpp·RKLLM, Gemma 4 E2B 초기 CPU 스윕 | llama.cpp·CIX NOE, Qwen3-1.7B 및 NPU용 Qwen2.5-0.5B |
+| Decode 포화 구간 | 초기 CPU 실험에서 약 2016 MHz로 추정 | 후속 CPU 실험에서 약 1500 MHz 이후 포화 |
+| RI 분석 범위 | CPU·GPU·NPU·Memory의 4×4 RI를 계획 | 메모리 주파수 직접 제어가 불가해 CPU·GPU·NPU의 3×3 RI와 CPU 읽기량으로 분석 |
+| 평가·구현 | 외장 전력계 확보와 KV 오프로딩·온라인 제어를 계획 | 열 면적으로 발열 비교, KV 오프로딩과 단계 인식 주파수 관리 구현·검증 |
 
-- CRAVE (EuroSys '25)
-- EnerInfer
-- KVSwap (MobiSys '26)
-- 정리 문서: [related-work.md](related-work.md) (참고 연구 3편, NPU 확장 현황, 본 연구와의 비교표 포함)
+플랫폼과 모델이 다르므로 중간 자료의 2016 MHz와 후속 실험의 1500 MHz를 동일 실험의 수정 전후 값으로 해석하지 않는다. 본 저장소의 재현 명령과 CSV는 **Orange Pi 실험**에 해당한다.
+
+## 시사점 및 제안
+
+- **단계 인식 제어:** CPU decode는 약 1.5 GHz 이후 추가적인 속도 향상이 제한되므로, prefill과 decode를 구분한 주파수 관리가 필요하다.
+- **오프로딩과 주파수 제어의 통합:** KV 접근 방식에 따라 병목과 동시 실행 간섭이 달라지므로, 오프로딩 여부와 주파수 설정을 함께 고려해야 한다. 측정된 긴 문맥·동시 실행 조건에서는 KV 오프로딩과 decode 1.5 GHz의 결합이 유효하였다.
+- **에너지 기준 재검증:** 전력 측정 장비를 추가하여 토큰당 에너지 소비를 평가하고, 모델·입력 길이·작업 조합을 확장하여 운용 조건의 일반성을 검증할 필요가 있다.
+
+## 연구의 한계
+
+대부분의 설정은 1~2회 측정했으며, 19% 감소를 보인 동시 실행은 설정당 1회 결과이다. “최적”은 측정한 후보 중 속도 조건을 만족하면서 열 면적이 낮은 설정을 의미한다. 측정 편차와 미측정 조합의 범위는 [실험 결과의 한계](results/README.md#limitations)에 기술하였다.
+
+KV 선택 품질은 이전에 측정한 어텐션 보존 비중과 소규모 NIAH 검사를 참고하였다. NPU는 다른 모델을 사용했고 발열 차이는 센서 해상도 아래였다. 자동 관리가 직접 바꾸는 값은 A720 주파수이며, 메모리 주파수와 KV 위치를 실행 중 함께 바꾸는 제어는 포함하지 않는다.
+
+추가 품질 검사와 0.5B 모델 실험은 [보조 실험](results/README.md#supplementary)에, 환경 준비와 실행 절차는 [재현 절차](code/README.md)에 있다.

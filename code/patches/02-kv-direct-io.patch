@@ -1,0 +1,856 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 0140d399b..f770e6845 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1422,19 +1422,34 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         res->reset();
+ 
+         ggml_backend_sched_reset(sched.get());
+-        if (cparams.cb_eval == nullptr && llama_kvswap_cfg::get().prefetch && llama_kvswap_cfg::get().selecting()) {
+-            // KVSwap stage 1: after layer il's attention, advise the kernel about layer il+1's selected K/V ranges
++        const auto & kcfg = llama_kvswap_cfg::get();
++        if (cparams.cb_eval == nullptr && (kcfg.io_direct || (kcfg.prefetch && kcfg.selecting()))) {
++            // KVSwap: observe two kinds of nodes per layer.
++            //   "kvswap_wait-<il>" (the KV write just before the attention): direct-I/O mode waits for the layer's reads here
++            //   "kqv_out-<il>"     (the attention output): direct-I/O mode flushes/evicts, mmap mode advises layer il+1
+             ggml_backend_sched_set_eval_callback(sched.get(), [](struct ggml_tensor * t, bool ask, void * ud) -> bool {
+-                static const char   pfx[] = "kqv_out-";
+-                const bool is_attn = strncmp(t->name, pfx, sizeof(pfx) - 1) == 0;
++                static const char pfx_wait[] = "kvswap_wait-";
++                static const char pfx_attn[] = "kqv_out-";
++                const bool is_wait = strncmp(t->name, pfx_wait, sizeof(pfx_wait) - 1) == 0;
++                const bool is_attn = strncmp(t->name, pfx_attn, sizeof(pfx_attn) - 1) == 0;
+                 if (ask) {
+-                    return is_attn;
++                    return is_wait || is_attn;
+                 }
+-                if (is_attn) {
+-                    auto * kv = dynamic_cast<llama_kv_cache *>(((llama_context *) ud)->get_memory());
+-                    if (kv) {
+-                        kv->kvswap_prefetch(atoi(t->name + sizeof(pfx) - 1) + 1);
++                auto * mem = ((llama_context *) ud)->get_memory();
++                auto * kv  = dynamic_cast<llama_kv_cache *>(mem);
++                if (!kv) {
++                    if (llama_kvswap_cfg::get().io_direct) {
++                        LLAMA_LOG_ERROR("kvswap: direct-I/O mode supports only the plain unified KV cache (not iSWA/hybrid/recurrent models)\n");
++                        abort();
+                     }
++                    return true;
++                }
++                if (is_wait) {
++                    kv->kvswap_dio_wait(atoi(t->name + sizeof(pfx_wait) - 1));
++                } else {
++                    const int il = atoi(t->name + sizeof(pfx_attn) - 1);
++                    kv->kvswap_dio_done(il);
++                    kv->kvswap_prefetch(il + 1);
+                 }
+                 return true;
+             }, this);
+@@ -1474,6 +1489,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+     }
+ 
+     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
++    if (llama_kvswap_cfg::get().io_direct) {
++        if (auto * kv = dynamic_cast<llama_kv_cache *>(get_memory())) {
++            kv->kvswap_dio_end(); // KVSwap stage 1b: all reads of this ubatch are finished here
++        }
++    }
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+         ret = status;
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index abf3069bb..b67d162f0 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2896,7 +2896,9 @@ ggml_tensor * llm_graph_context::build_attn(
+         const auto & v_idxs = inp->get_v_idxs();
+ 
+         ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
++        ggml_tensor * cpy_v = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il);
++        cb(cpy_v, "kvswap_wait", il); // KVSwap direct I/O waits for this layer's KV reads right before the attention
++        ggml_build_forward_expand(gf, cpy_v);
+     }
+ 
+     ggml_tensor * kq_mask = inp->get_kq_mask();
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 54d85c53d..7b7b285ae 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -3,6 +3,7 @@
+ #include "llama-impl.h"
+ #include "llama-io.h"
+ #include "llama-kvswap.h"
++#include "llama-kvswap-io.h"
+ #include "llama-model.h"
+ #include "llama-context.h"
+ 
+@@ -282,7 +283,65 @@ llama_kv_cache::llama_kv_cache(
+             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
+             }
+-        } else if (llama_kvswap_cfg::get().file_backed() && ggml_backend_buft_is_host(buft)) {
++        } else if (llama_kvswap_cfg::get().io_direct && ggml_backend_buft_is_host(buft) && swa_type == LLAMA_SWA_TYPE_NONE && !other) {
++            // KVSwap stage 1b: anonymous staging memory laid out like the file, explicit O_DIRECT I/O, no page cache
++            const auto & kc = llama_kvswap_cfg::get();
++            if (kvdio) {
++                throw std::runtime_error("direct-I/O KV mode supports a single host buffer");
++            }
++            if (n_stream != 1 || n_seq_max != 1) {
++                throw std::runtime_error("direct-I/O KV mode needs a single sequence (use -np 1 / one stream)");
++            }
++            if (v_trans) {
++                throw std::runtime_error("direct-I/O KV mode needs a non-transposed V cache: run with flash attention (-fa on)");
++            }
++            if (map_layer_ids.size() != layers.size()) {
++                throw std::runtime_error("direct-I/O KV mode does not support layers that share or reuse a KV cache");
++            }
++            const size_t A = std::max<size_t>(4096, (size_t) sysconf(_SC_PAGESIZE));
++            for (const auto & layer : layers) {
++                for (ggml_tensor * t : { layer.k, layer.v }) {
++                    if (t && ((size_t) kc.group*t->nb[1]) % A != 0) {
++                        throw std::runtime_error("direct-I/O KV mode: a group of " + std::to_string(kc.group) + " cells is " +
++                                std::to_string((size_t) kc.group*t->nb[1]) + " bytes, not a multiple of " + std::to_string(A) +
++                                "; choose a larger LLAMA_KV_GROUP");
++                    }
++                }
++            }
++            size_t off = 0;
++            std::vector<std::pair<ggml_tensor *, size_t>> place;
++            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
++                if (t->view_src != nullptr) {
++                    continue;
++                }
++                off = llama_kvswap_dio::align_up(off, A);
++                place.emplace_back(t, off);
++                off += ggml_nbytes(t);
++            }
++            const size_t sz = llama_kvswap_dio::align_up(off, A);
++            kvdio = std::make_shared<llama_kvswap_dio>();
++            if (!kvdio->open(kc.path, sz, (int) layers.size(), kc.io_threads, (size_t) kc.io_chunk_kb*1024)) {
++                kvdio.reset();
++                throw std::runtime_error("failed to set up the direct-I/O KV file: " + kc.path);
++            }
++            buf = ggml_backend_cpu_buffer_from_ptr(kvdio->base, kvdio->size);
++            if (!buf) {
++                throw std::runtime_error("failed to wrap the direct-I/O KV staging memory");
++            }
++            for (auto & [t, o] : place) {
++                if (ggml_backend_tensor_alloc(buf, t, kvdio->base + o) != GGML_STATUS_SUCCESS) {
++                    throw std::runtime_error("failed to place kv tensor in the direct-I/O staging memory");
++                }
++            }
++            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
++                if (t->view_src != nullptr) {
++                    ggml_backend_view_init(t);
++                }
++            }
++            LLAMA_LOG_INFO("%s: KV cache in direct-I/O mode, file %s (%.2f MiB, %s, align=%zu, threads=%u, chunk=%u KiB, depth=%u, M=%u G=%u W=%u)\n",
++                    __func__, kc.path.c_str(), sz/1024.0/1024.0, kvdio->direct ? "O_DIRECT" : "BUFFERED", kvdio->align,
++                    kc.io_threads, kc.io_chunk_kb, kc.io_depth, kc.select_m, kc.group, kc.window);
++        } else if (llama_kvswap_cfg::get().file_backed() && !llama_kvswap_cfg::get().io_direct && ggml_backend_buft_is_host(buft)) {
+             // KVSwap stage 1: back the KV tensors with a file instead of anonymous memory
+             const size_t sz = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+             auto map = std::make_shared<llama_kvswap_map>();
+@@ -321,7 +380,7 @@ llama_kv_cache::llama_kv_cache(
+         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+ 
+         // a fresh sparse file already reads back as zero; memset would dirty the whole file
+-        if (kvswap_maps.empty()) {
++        if (kvswap_maps.empty() && !kvdio) {
+             ggml_backend_buffer_clear(buf, 0);
+         }
+         ctxs_bufs.emplace_back(std::move(ctx), buf);
+@@ -405,7 +464,10 @@ void llama_kv_cache::clear(bool data) {
+         v_heads[s] = 0;
+     }
+ 
+-    if (data && kvswap_maps.empty()) {
++    kvdio_lo = 0;
++    kvdio_st = kvdio_state();
++
++    if (data && kvswap_maps.empty() && !kvdio) {
+         for (auto & [_, buf] : ctxs_bufs) {
+             ggml_backend_buffer_clear(buf.get(), 0);
+         }
+@@ -1281,7 +1343,7 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
+ }
+ 
+ void llama_kv_cache::kvswap_prefetch(int32_t il) const {
+-    if (kvswap_sel.empty()) {
++    if (kvdio || kvswap_sel.empty()) {
+         return;
+     }
+     auto it = map_layer_ids.find(il);
+@@ -1300,6 +1362,171 @@ void llama_kv_cache::kvswap_prefetch(int32_t il) const {
+     }
+ }
+ 
++void llama_kv_cache::kvdio_rows(uint32_t ci, uint32_t a, uint32_t b, size_t & off_k, size_t & len_k, size_t & off_v, size_t & len_v) const {
++    const auto & layer = layers[ci];
++    off_k = (size_t) ((const uint8_t *) layer.k->data - kvdio->base) + (size_t) a*layer.k->nb[1];
++    len_k = (size_t) (b - a)*layer.k->nb[1];
++    off_v = (size_t) ((const uint8_t *) layer.v->data - kvdio->base) + (size_t) a*layer.v->nb[1];
++    len_v = (size_t) (b - a)*layer.v->nb[1];
++}
++
++void llama_kv_cache::kvdio_issue(uint32_t ci) const {
++    size_t ok, lk, ov, lv;
++    for (const auto & r : kvdio_st.load) {
++        kvdio_rows(ci, r.first, r.second, ok, lk, ov, lv);
++        kvdio->submit_read((int) ci, ok, lk);
++        kvdio->submit_read((int) ci, ov, lv);
++    }
++}
++
++void llama_kv_cache::kvdio_begin(uint32_t p0, uint32_t p1, bool decode, uint32_t recent0,
++        std::vector<std::pair<uint32_t, uint32_t>> && load) const {
++    auto & st = kvdio_st;
++    if (st.active) {
++        return; // already begun for this ubatch
++    }
++    st.active = true;
++    st.decode = decode;
++    st.p0     = p0;
++    st.p1     = p1;
++    st.load   = std::move(load);
++    st.issued = 0;
++    st.waited.assign(layers.size(), 0);
++    st.done.assign(layers.size(), 0);
++
++    size_t ok, lk, ov, lv;
++
++    // bring cells [a, b) back into RAM for every layer and wait for them
++    auto readback = [&](uint32_t a, uint32_t b) {
++        for (uint32_t ci = 0; ci < layers.size(); ++ci) {
++            kvdio_rows(ci, a, b, ok, lk, ov, lv);
++            kvdio->submit_read((int) ci, ok, lk);
++            kvdio->submit_read((int) ci, ov, lv);
++        }
++        kvdio->wait_all();
++    };
++
++    if (!decode) {
++        if (kvdio_lo > 0) {
++            // a multi-token ubatch after decoding (e.g. a second prompt) attends to everything: make it all resident again
++            readback(0, kvdio_lo);
++            kvdio_lo = 0;
++        }
++        return;
++    }
++
++    kvdio->steps++;
++
++    if (recent0 < kvdio_lo) {
++        readback(recent0, kvdio_lo); // window moved backwards (cache was edited): the cells are in the file
++        kvdio_lo = recent0;
++    } else if (recent0 > kvdio_lo) {
++        // groups that slid out of the window were flushed when they completed: release their RAM
++        for (uint32_t ci = 0; ci < layers.size(); ++ci) {
++            kvdio_rows(ci, kvdio_lo, recent0, ok, lk, ov, lv);
++            kvdio->evict(ok, lk);
++            kvdio->evict(ov, lv);
++        }
++        kvdio_lo = recent0;
++    }
++
++    // layer 0 is needed right away, the following ones overlap with the computation of the layers before them
++    const uint32_t depth = llama_kvswap_cfg::get().io_depth;
++    while (st.issued <= depth && st.issued < layers.size()) {
++        kvdio_issue(st.issued++);
++    }
++}
++
++void llama_kv_cache::kvswap_dio_wait(int32_t il) const {
++    auto & st = kvdio_st;
++    if (!kvdio || !st.active || !st.decode) {
++        return;
++    }
++    const auto it = map_layer_ids.find(il);
++    if (it == map_layer_ids.end()) {
++        return;
++    }
++    const uint32_t ci = it->second;
++    while (st.issued <= ci) {
++        kvdio_issue(st.issued++);
++    }
++    kvdio->wait((int) ci);
++    st.waited[ci] = 1;
++}
++
++void llama_kv_cache::kvswap_dio_done(int32_t il) const {
++    auto & st = kvdio_st;
++    if (!kvdio || !st.active) {
++        return;
++    }
++    const auto it = map_layer_ids.find(il);
++    if (it == map_layer_ids.end()) {
++        return;
++    }
++    const uint32_t ci = it->second;
++    size_t ok, lk, ov, lv;
++
++    if (st.decode) {
++        if (!st.waited[ci]) {
++            LLAMA_LOG_ERROR("%s: layer %d attention ran without waiting for its KV reads; this model's attention path is not "
++                            "supported in direct-I/O mode\n", __func__, il);
++            abort();
++        }
++        // the cells read for this layer are no longer needed
++        for (const auto & r : st.load) {
++            kvdio_rows(ci, r.first, r.second, ok, lk, ov, lv);
++            kvdio->evict(ok, lk);
++            kvdio->evict(ov, lv);
++        }
++    }
++    st.done[ci] = 1;
++
++    // groups completed by this ubatch go to the file (they stay resident until they leave the window)
++    const uint32_t G = llama_kvswap_cfg::get().group;
++    const uint32_t a = st.p0/G*G;
++    const uint32_t b = st.p1/G*G;
++    if (b > a) {
++        kvdio_rows(ci, a, b, ok, lk, ov, lv);
++        kvdio->write_sync(ok, lk);
++        kvdio->write_sync(ov, lv);
++    }
++
++    if (st.decode) {
++        const uint32_t depth = llama_kvswap_cfg::get().io_depth;
++        while (st.issued < layers.size() && st.issued <= ci + depth + 1) {
++            kvdio_issue(st.issued++);
++        }
++    }
++}
++
++void llama_kv_cache::kvswap_dio_end() const {
++    auto & st = kvdio_st;
++    if (!kvdio || !st.active) {
++        return;
++    }
++    kvdio->wait_all();
++    if (st.decode) {
++        // layers whose attention hook never ran would leak their loaded pages
++        size_t ok, lk, ov, lv;
++        for (uint32_t ci = 0; ci < st.issued && ci < layers.size(); ++ci) {
++            if (!st.done[ci]) {
++                for (const auto & r : st.load) {
++                    kvdio_rows(ci, r.first, r.second, ok, lk, ov, lv);
++                    kvdio->evict(ok, lk);
++                    kvdio->evict(ov, lv);
++                }
++            }
++        }
++        const uint32_t every = llama_kvswap_cfg::get().debug_every;
++        if (every > 0 && kvdio->steps % every == 0) {
++            LLAMA_LOG_INFO("kvswap_dio: step %llu pos=%u lo=%u resident_MiB=%.1f read_MiB=%.1f stall_s=%.3f\n",
++                    (unsigned long long) kvdio->steps, st.p1, kvdio_lo, kvdio->resident_bytes()/1048576.0,
++                    kvdio->bytes_read.load()/1048576.0, kvdio->stall_s);
++        }
++    }
++    st.active = false;
++}
++
+ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+     uint32_t result = 0;
+ 
+@@ -1836,26 +2063,33 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+     }
+ 
+     // KVSwap stage 1: during decoding keep only sink groups + M evenly spaced groups + the recent window,
+-    // so the flash-attention kernel skips (and never faults in) every other cell
++    // so the flash-attention kernel skips (and never faults in) every other cell.
++    // Stage 1b (direct I/O) also needs to know which groups have to be read back from the file.
+     kvswap_sel.clear();
+     const auto & kcfg = llama_kvswap_cfg::get();
+-    if (kcfg.selecting() && n_tps == 1 && swa_type == LLAMA_SWA_TYPE_NONE) {
++    std::vector<std::pair<uint32_t, uint32_t>> dio_load;
++    uint32_t dio_recent0 = 0;
++    if (swa_type == LLAMA_SWA_TYPE_NONE && n_tps == 1 && (kcfg.selecting() || kvdio)) {
+         const bool f16 = dst->type == GGML_TYPE_F16;
+         const uint32_t G = kcfg.group;
+         for (int64_t s = 0; s < n_stream; ++s) {
+             const int64_t N = (int64_t) ubatch->pos[s] + 1; // tokens visible to this decode step
+-            if (N <= (int64_t) kcfg.window + (int64_t) G*(kcfg.select_m + kcfg.sink_groups)) {
++            const bool sel = kcfg.selecting() && N > (int64_t) kcfg.window + (int64_t) G*(kcfg.select_m + kcfg.sink_groups);
++            if (!sel && !kvdio) {
+                 continue; // short context: read everything
+             }
+             const int64_t ng = (N + G - 1)/G;
+-            std::vector<char> keep_g(ng, 0);
+-            for (uint32_t g = 0; g < kcfg.sink_groups && g < ng; ++g) {
+-                keep_g[g] = 1;
+-            }
+-            for (uint32_t k = 0; k < kcfg.select_m; ++k) {
+-                keep_g[(int64_t) k*ng/kcfg.select_m] = 1;
++            // the recent window starts on a group boundary, so every group is either fully resident or fully loadable
++            const int64_t recent0 = std::max<int64_t>(0, N - (int64_t) kcfg.window)/G*G;
++            std::vector<char> keep_g(ng, sel ? 0 : 1);
++            if (sel) {
++                for (uint32_t g = 0; g < kcfg.sink_groups && g < ng; ++g) {
++                    keep_g[g] = 1;
++                }
++                for (uint32_t k = 0; k < kcfg.select_m; ++k) {
++                    keep_g[(int64_t) k*ng/kcfg.select_m] = 1;
++                }
+             }
+-            const int64_t recent0 = std::max<int64_t>(0, N - (int64_t) kcfg.window);
+             std::vector<std::pair<uint32_t, uint32_t>> ranges;
+             for (int64_t j = 0; j < n_kv; ++j) {
+                 const bool keep = j < N && (j >= recent0 || keep_g[j/G]);
+@@ -1866,7 +2100,7 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+                         ranges.emplace_back((uint32_t) j, (uint32_t) j + 1);
+                     }
+                 }
+-                if (!keep) {
++                if (!keep && sel) {
+                     if (f16) {
+                         ((ggml_fp16_t *) dst->data)[s*n_kv + j] = llama_cast<ggml_fp16_t>(-INFINITY);
+                     } else {
+@@ -1875,11 +2109,36 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+                 }
+             }
+             if (s == 0) {
+-                kvswap_sel = std::move(ranges);
++                if (kvdio) {
++                    dio_recent0 = (uint32_t) recent0;
++                    for (int64_t g = 0; g < ng && (g + 1)*G <= recent0; ++g) {
++                        if (!keep_g[g]) {
++                            continue;
++                        }
++                        const uint32_t a = (uint32_t) (g*G), b = (uint32_t) ((g + 1)*G);
++                        if (!dio_load.empty() && dio_load.back().second == a) {
++                            dio_load.back().second = b;
++                        } else {
++                            dio_load.emplace_back(a, b);
++                        }
++                    }
++                }
++                if (sel) {
++                    kvswap_sel = std::move(ranges);
++                }
+             }
+         }
+     }
+ 
++    if (kvdio) {
++        const uint32_t nt = ubatch->n_tokens;
++        GGML_ASSERT(n_stream == 1 && ubatch->pos[nt - 1] == ubatch->pos[0] + (llama_pos) (nt - 1));
++        const uint32_t p0 = (uint32_t) ubatch->pos[0];
++        // single sequence, no shifting: cell index == position (the direct-I/O layout relies on it)
++        GGML_ASSERT(v_cells[0].pos_get(p0) == (llama_pos) p0);
++        kvdio_begin(p0, p0 + nt, n_tps == 1, dio_recent0, std::move(dio_load));
++    }
++
+     //const int64_t t_end = ggml_time_us();
+ 
+     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 5d471c439..f7bbbc772 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -158,6 +158,12 @@ public:
+     // KVSwap stage 1: advise the kernel that the selected K/V ranges of layer il will be read soon
+     void kvswap_prefetch(int32_t il) const;
+ 
++    // KVSwap stage 1b (direct I/O). All of these are no-ops unless the cache was built in direct-I/O mode.
++    bool kvswap_dio_enabled() const { return kvdio != nullptr; }
++    void kvswap_dio_wait(int32_t il) const;   // before the attention of layer il: its cells must be in RAM
++    void kvswap_dio_done(int32_t il) const;   // after the attention of layer il: flush new groups, evict the rest
++    void kvswap_dio_end()  const;             // after the whole ubatch has been computed
++
+     uint32_t get_size()     const;
+     uint32_t get_n_stream() const;
+ 
+@@ -303,6 +309,27 @@ private:
+     // cell ranges [first, last) chosen for the current decode step (merged, sorted); empty = no selection
+     mutable std::vector<std::pair<uint32_t, uint32_t>> kvswap_sel;
+ 
++    // KVSwap stage 1b: staging memory + file + reader threads (null = disabled)
++    std::shared_ptr<struct llama_kvswap_dio> kvdio;
++
++    struct kvdio_state {
++        bool     active = false;   // between kvdio_begin() and kvswap_dio_end() of one ubatch
++        bool     decode = false;   // single-token ubatch: only a selected subset of old cells is brought into RAM
++        uint32_t p0 = 0;           // first position written by this ubatch
++        uint32_t p1 = 0;           // one past the last position written by this ubatch
++        std::vector<std::pair<uint32_t, uint32_t>> load;   // cell ranges [first, last) every layer has to read
++        uint32_t issued = 0;       // layers [0, issued) have had their reads submitted
++        std::vector<uint8_t> waited;
++        std::vector<uint8_t> done;
++    };
++    mutable kvdio_state kvdio_st;
++    mutable uint32_t    kvdio_lo = 0;   // cells [0, kvdio_lo) are NOT resident (only in the file)
++
++    void kvdio_begin(uint32_t p0, uint32_t p1, bool decode, uint32_t recent0,
++            std::vector<std::pair<uint32_t, uint32_t>> && load) const;
++    void kvdio_issue(uint32_t ci) const;                       // submit the reads of cache layer ci
++    void kvdio_rows(uint32_t ci, uint32_t a, uint32_t b, size_t & off_k, size_t & len_k, size_t & off_v, size_t & len_v) const;
++
+     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
+     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
+     std::vector<uint32_t> v_heads;
+diff --git a/src/llama-kvswap-io.h b/src/llama-kvswap-io.h
+new file mode 100644
+index 000000000..651f39f98
+--- /dev/null
++++ b/src/llama-kvswap-io.h
+@@ -0,0 +1,313 @@
++#pragma once
++
++// KVSwap stage 1b (PajamaParties): explicit direct I/O engine for the KV cache.
++//
++//   anonymous memory  ==  RAM staging area, laid out exactly like the file (file offset == offset inside the mapping)
++//   backing file      ==  the only complete copy of the KV cache; read with O_DIRECT, written with O_DIRECT
++//
++// Cells that leave the resident window are written once to the file and released with MADV_DONTNEED.
++// Before a layer's attention the cells it needs are read back into the *same* addresses, so the unmodified
++// flash-attention kernel (with the stage-1 mask hiding everything else) works on the staging memory.
++// After the attention the pages are released again. Nothing depends on the OS page cache or on a cgroup limit.
++
++#include "llama-kvswap.h"
++#include "llama-impl.h"
++
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstring>
++#include <deque>
++#include <mutex>
++#include <thread>
++
++#ifdef LLAMA_KVSWAP_POSIX
++#include <cerrno>
++#ifndef MAP_ANONYMOUS
++#define MAP_ANONYMOUS MAP_ANON
++#endif
++#ifdef __APPLE__
++#define MINCORE_VEC_T char
++#else
++#define MINCORE_VEC_T unsigned char
++#endif
++#ifndef MAP_NORESERVE
++#define MAP_NORESERVE 0
++#endif
++#endif
++
++struct llama_kvswap_dio {
++    uint8_t * base  = nullptr;   // anonymous mapping, page aligned
++    size_t    size  = 0;
++    size_t    align = 4096;      // alignment of every file offset / length / buffer address
++    int       fd    = -1;
++    bool      direct = false;    // O_DIRECT (Linux) or F_NOCACHE (macOS) in effect
++
++    // ---- read worker pool -------------------------------------------------------------------------------------
++    struct job { size_t off; size_t len; int ticket; };
++
++    std::vector<std::thread> workers;
++    std::mutex               mu;
++    std::condition_variable  cv_job;
++    std::condition_variable  cv_done;
++    std::deque<job>          q;
++    std::vector<int>         pending;      // outstanding jobs per ticket (= per KV layer)
++    bool                     stop   = false;
++    bool                     failed = false;
++    size_t                   chunk  = 1u << 20;
++
++    // ---- statistics ------------------------------------------------------------------------------------------
++    std::atomic<uint64_t> bytes_read{0};
++    std::atomic<uint64_t> n_reads{0};
++    uint64_t bytes_written = 0;
++    uint64_t n_writes      = 0;
++    uint64_t bytes_evicted = 0;
++    double   stall_s       = 0.0;          // time the compute thread waited for reads
++    double   write_s       = 0.0;
++    uint64_t steps         = 0;
++
++    llama_kvswap_dio() = default;
++    llama_kvswap_dio(const llama_kvswap_dio &) = delete;
++    llama_kvswap_dio & operator=(const llama_kvswap_dio &) = delete;
++
++    static size_t align_up(size_t x, size_t a) { return (x + a - 1) / a * a; }
++
++    bool open(const std::string & path, size_t sz, int n_tickets, uint32_t n_threads, size_t chunk_bytes) {
++#ifdef LLAMA_KVSWAP_POSIX
++        const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
++        align = std::max<size_t>(4096, pg);
++        size  = align_up(sz, align);
++        chunk = std::max<size_t>(align, chunk_bytes / align * align);
++
++        int flags = O_RDWR | O_CREAT | O_TRUNC;
++#ifdef O_DIRECT
++        fd = ::open(path.c_str(), flags | O_DIRECT, 0644);
++        direct = fd >= 0;
++        if (fd < 0 && errno == EINVAL) {
++            LLAMA_LOG_WARN("%s: O_DIRECT not supported on %s, falling back to buffered I/O + fadvise(DONTNEED)\n", __func__, path.c_str());
++        }
++#endif
++        if (fd < 0) {
++            fd = ::open(path.c_str(), flags, 0644);
++#ifdef F_NOCACHE
++            if (fd >= 0 && fcntl(fd, F_NOCACHE, 1) == 0) {
++                direct = true;
++            }
++#endif
++        }
++        if (fd < 0) {
++            LLAMA_LOG_ERROR("%s: cannot open %s: %s\n", __func__, path.c_str(), strerror(errno));
++            return false;
++        }
++        if (ftruncate(fd, (off_t) size) != 0) {
++            LLAMA_LOG_ERROR("%s: ftruncate failed: %s\n", __func__, strerror(errno));
++            return false;
++        }
++        void * m = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++        if (m == MAP_FAILED) {
++            LLAMA_LOG_ERROR("%s: anonymous mmap of %zu bytes failed: %s\n", __func__, size, strerror(errno));
++            return false;
++        }
++        base = (uint8_t *) m;
++#ifdef MADV_NOHUGEPAGE
++        madvise(base, size, MADV_NOHUGEPAGE);   // 2 MiB pages would make partial eviction impossible
++#endif
++        pending.assign(n_tickets, 0);
++        for (uint32_t i = 0; i < n_threads; ++i) {
++            workers.emplace_back([this] { worker(); });
++        }
++        return true;
++#else
++        (void) path; (void) sz; (void) n_tickets; (void) n_threads; (void) chunk_bytes;
++        return false;
++#endif
++    }
++
++    ~llama_kvswap_dio() {
++#ifdef LLAMA_KVSWAP_POSIX
++        {
++            std::lock_guard<std::mutex> lk(mu);
++            stop = true;
++        }
++        cv_job.notify_all();
++        for (auto & t : workers) {
++            t.join();
++        }
++        if (steps > 0) {
++            LLAMA_LOG_INFO("kvswap_dio: steps=%llu read_MiB=%.1f reads=%llu write_MiB=%.1f writes=%llu evict_MiB=%.1f stall_s=%.3f write_s=%.3f resident_MiB=%.1f\n",
++                    (unsigned long long) steps, bytes_read.load()/1048576.0, (unsigned long long) n_reads.load(),
++                    bytes_written/1048576.0, (unsigned long long) n_writes, bytes_evicted/1048576.0,
++                    stall_s, write_s, resident_bytes()/1048576.0);
++        }
++        if (base) {
++            munmap(base, size);
++        }
++        if (fd >= 0) {
++            ::close(fd);
++        }
++#endif
++    }
++
++    // ---- reads ----------------------------------------------------------------------------------------------
++    // queue [off, off+len) of the file to be read into base+off; returns immediately
++    void submit_read(int ticket, size_t off, size_t len) {
++        GGML_ASSERT(off % align == 0 && len % align == 0 && off + len <= size);
++        std::lock_guard<std::mutex> lk(mu);
++        for (size_t o = 0; o < len; o += chunk) {
++            q.push_back({ off + o, std::min(chunk, len - o), ticket });
++            pending[ticket]++;
++        }
++        cv_job.notify_all();
++    }
++
++    // block until every read submitted for this ticket has finished
++    void wait(int ticket) {
++        const auto t0 = std::chrono::steady_clock::now();
++        std::unique_lock<std::mutex> lk(mu);
++        cv_done.wait(lk, [&] { return pending[ticket] == 0; });
++        stall_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++        if (failed) {
++            LLAMA_LOG_ERROR("kvswap_dio: a read from the KV file failed, cannot continue\n");
++            abort();
++        }
++    }
++
++    void wait_all() {
++        for (size_t t = 0; t < pending.size(); ++t) {
++            wait((int) t);
++        }
++    }
++
++    // ---- writes / eviction (called from the compute thread) ---------------------------------------------------
++    void write_sync(size_t off, size_t len) {
++#ifdef LLAMA_KVSWAP_POSIX
++        GGML_ASSERT(off % align == 0 && len % align == 0 && off + len <= size);
++        const auto t0 = std::chrono::steady_clock::now();
++        size_t done = 0;
++        while (done < len) {
++            const ssize_t r = pwrite(fd, base + off + done, len - done, (off_t) (off + done));
++            if (r < 0 && errno == EINTR) {
++                continue;
++            }
++            if (r <= 0) {
++                LLAMA_LOG_ERROR("kvswap_dio: pwrite failed: %s\n", strerror(errno));
++                abort();
++            }
++            done += (size_t) r;
++        }
++        if (!direct) {
++            drop_cache(off, len, /*sync_first=*/true);
++        }
++        bytes_written += len;
++        n_writes++;
++        write_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++#else
++        (void) off; (void) len;
++#endif
++    }
++
++    // give the pages back to the OS; the next touch reads zeros (the file still has the data)
++    void evict(size_t off, size_t len) {
++#ifdef LLAMA_KVSWAP_POSIX
++        GGML_ASSERT(off % align == 0 && len % align == 0 && off + len <= size);
++        if (len == 0) {
++            return;
++        }
++#ifdef __APPLE__
++        // macOS only treats MADV_DONTNEED as a hint and keeps the pages; replacing the mapping really frees them
++        mmap(base + off, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
++#else
++        madvise(base + off, len, MADV_DONTNEED);
++#endif
++        bytes_evicted += len;
++#else
++        (void) off; (void) len;
++#endif
++    }
++
++    // bytes of the staging area currently resident in RAM
++    size_t resident_bytes() const {
++#ifdef LLAMA_KVSWAP_POSIX
++        const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
++        std::vector<unsigned char> vec((size_t) 1 << 14);   // 16384 pages per call
++        size_t total = 0;
++        for (size_t o = 0; o < size; o += vec.size() * pg) {
++            const size_t len = std::min(vec.size() * pg, size - o);
++            if (mincore(base + o, len, (MINCORE_VEC_T *) vec.data()) != 0) {
++                return 0;
++            }
++            for (size_t i = 0; i < (len + pg - 1) / pg; ++i) {
++                total += (vec[i] & 1) ? pg : 0;
++            }
++        }
++        return total;
++#else
++        return 0;
++#endif
++    }
++
++private:
++    void drop_cache(size_t off, size_t len, bool sync_first) {
++#ifdef LLAMA_KVSWAP_POSIX
++#if defined(__linux__)
++        if (sync_first) {
++            fdatasync(fd);
++        }
++        posix_fadvise(fd, (off_t) off, (off_t) len, POSIX_FADV_DONTNEED);
++#else
++        (void) off; (void) len; (void) sync_first;
++#endif
++#else
++        (void) off; (void) len; (void) sync_first;
++#endif
++    }
++
++    bool read_full(size_t off, size_t len) {
++#ifdef LLAMA_KVSWAP_POSIX
++        size_t done = 0;
++        while (done < len) {
++            const ssize_t r = pread(fd, base + off + done, len - done, (off_t) (off + done));
++            if (r < 0 && errno == EINTR) {
++                continue;
++            }
++            if (r <= 0) {
++                return false;
++            }
++            done += (size_t) r;
++        }
++        if (!direct) {
++            drop_cache(off, len, /*sync_first=*/false);
++        }
++        bytes_read += len;
++        n_reads++;
++        return true;
++#else
++        (void) off; (void) len;
++        return false;
++#endif
++    }
++
++    void worker() {
++        for (;;) {
++            job j;
++            {
++                std::unique_lock<std::mutex> lk(mu);
++                cv_job.wait(lk, [&] { return stop || !q.empty(); });
++                if (q.empty()) {
++                    return;
++                }
++                j = q.front();
++                q.pop_front();
++            }
++            const bool ok = read_full(j.off, j.len);
++            {
++                std::lock_guard<std::mutex> lk(mu);
++                if (!ok) {
++                    failed = true;
++                }
++                pending[j.ticket]--;
++            }
++            cv_done.notify_all();
++        }
++    }
++};
+diff --git a/src/llama-kvswap.h b/src/llama-kvswap.h
+index 859e3df74..08ba75d3a 100644
+--- a/src/llama-kvswap.h
++++ b/src/llama-kvswap.h
+@@ -9,6 +9,15 @@
+ //   LLAMA_KV_WINDOW        recent window W in cells, always kept (default 256)
+ //   LLAMA_KV_SINK_GROUPS   leading groups always kept (default 4)
+ //   LLAMA_KV_PREFETCH      1 = posix_madvise(WILLNEED) next layer's selected ranges
++//
++// Direct-I/O mode (stage 1b): the KV cache lives in anonymous memory that is *evicted* after use, the file is the
++// only copy of old cells, and the needed cells are read back with explicit O_DIRECT reads. Works with or without a
++// memory limit because residency is controlled by us, not by the page cache.
++//   LLAMA_KV_IO            direct = enable direct-I/O mode (needs LLAMA_KV_OFFLOAD_PATH); anything else = mmap mode
++//   LLAMA_KV_IO_THREADS    reader threads (queue depth), default 4
++//   LLAMA_KV_IO_CHUNK_KB   max bytes per read request in KiB, default 1024
++//   LLAMA_KV_IO_DEPTH      layers loaded ahead of the layer being computed, default 1 (0 = only the current layer)
++//   LLAMA_KV_DEBUG         N > 0 = log resident KV bytes (mincore) every N decode steps
+ 
+ #include <algorithm>
+ #include <cstdint>
+@@ -32,6 +41,11 @@ struct llama_kvswap_cfg {
+     uint32_t window     = 256;
+     uint32_t sink_groups = 4;
+     bool     prefetch   = false;
++    bool     io_direct  = false;
++    uint32_t io_threads = 4;
++    uint32_t io_chunk_kb = 1024;
++    uint32_t io_depth   = 1;
++    uint32_t debug_every = 0;
+ 
+     static const llama_kvswap_cfg & get() {
+         static const llama_kvswap_cfg cfg = [] {
+@@ -48,6 +62,12 @@ struct llama_kvswap_cfg {
+             c.window      = geti("LLAMA_KV_WINDOW", 256);
+             c.sink_groups = geti("LLAMA_KV_SINK_GROUPS", 4);
+             c.prefetch    = geti("LLAMA_KV_PREFETCH", 0) != 0;
++            const char * io = getenv("LLAMA_KV_IO");
++            c.io_direct   = io && std::string(io) == "direct" && !c.path.empty();
++            c.io_threads  = std::max<uint32_t>(1, geti("LLAMA_KV_IO_THREADS", 4));
++            c.io_chunk_kb = std::max<uint32_t>(4, geti("LLAMA_KV_IO_CHUNK_KB", 1024));
++            c.io_depth    = geti("LLAMA_KV_IO_DEPTH", 1);
++            c.debug_every = geti("LLAMA_KV_DEBUG", 0);
+             return c;
+         }();
+         return cfg;

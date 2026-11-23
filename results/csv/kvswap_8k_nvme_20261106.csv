@@ -1,0 +1,6 @@
+run,tag,mode,mem,G,M,prefetch,io,depth,exit,prompt_tps,decode_tps,tpot_ms,n_decode,majflt,max_rss_mb,kv_read_mb,kv_reads,kv_write_mb,io_stall_s,kv_write_s,kv_resident_mb,io_r_s,io_rkB_s,io_r_await_ms,io_util_pct,iowait_pct,temp_end_c
+B0_base_r1,B0_base,base,none,,,,none,,0,10.16,11.48,87.12,63,144,3041.93,,,,,,,0,0,0,0,0,49
+B1_file_r1,B1_file,file,none,,,,direct,1,0,10.03,2.44,409.79,63,144,2971.81,51142,53760,830.40,5.60,9.84,28.70,15656.85,1996416,0.99,72.09,19.64,47
+B2_unif_m50_r1,B2_unif_m50,select,none,8,50,1,direct,1,0,10.04,5.45,183.51,63,148,2971.68,2912,175616,830.40,4.50,10.03,28.70,13792.01,234187.18,0.14,51.19,13.49,49
+B3_pred_r128_m50_r1,B3_pred_r128_m50,select,none,8,50,1,direct,1,0,9.97,5.78,172.87,63,146,3096.49,3024,125970,830.40,3.36,9.86,28.70,11525.82,278650.18,0.16,49.49,14.61,47
+B3eval_pred_r128_m50_r1,B3eval_pred_r128_m50,select,none,8,50,1,mmap,,0,10.08,1.34,747.96,31,212012,3101.42,,,,,,,0,0,0,0.78,0.05,46

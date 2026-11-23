@@ -1,0 +1,928 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index e3fc432..25bee92 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1423,17 +1423,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+ 
+         ggml_backend_sched_reset(sched.get());
+         const auto & kcfg = llama_kvswap_cfg::get();
+-        if (cparams.cb_eval == nullptr && (kcfg.io_direct || (kcfg.prefetch && kcfg.selecting()))) {
++        if (cparams.cb_eval == nullptr && (kcfg.io_direct || (kcfg.prefetch && kcfg.selecting()) || kcfg.predicting())) {
+             // KVSwap: observe two kinds of nodes per layer.
+             //   "kvswap_wait-<il>" (the KV write just before the attention): direct-I/O mode waits for the layer's reads here
+             //   "kqv_out-<il>"     (the attention output): direct-I/O mode flushes/evicts, mmap mode advises layer il+1
+             ggml_backend_sched_set_eval_callback(sched.get(), [](struct ggml_tensor * t, bool ask, void * ud) -> bool {
+                 static const char pfx_wait[] = "kvswap_wait-";
+                 static const char pfx_attn[] = "kqv_out-";
++                static const char pfx_pred[] = "kvswap_q-";   // stage 2: approximate query of a layer
++                static const char pfx_qcur[] = "Qcur-";       // stage 2 evaluation: exact query
+                 const bool is_wait = strncmp(t->name, pfx_wait, sizeof(pfx_wait) - 1) == 0;
+                 const bool is_attn = strncmp(t->name, pfx_attn, sizeof(pfx_attn) - 1) == 0;
++                const bool is_pred = strncmp(t->name, pfx_pred, sizeof(pfx_pred) - 1) == 0;
++                const bool is_qcur = llama_kvswap_cfg::get().pred_eval && strncmp(t->name, pfx_qcur, sizeof(pfx_qcur) - 1) == 0;
+                 if (ask) {
+-                    return is_wait || is_attn;
++                    return is_wait || is_attn || is_pred || is_qcur;
+                 }
+                 auto * mem = ((llama_context *) ud)->get_memory();
+                 auto * kv  = dynamic_cast<llama_kv_cache *>(mem);
+@@ -1444,10 +1448,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+                     }
+                     return true;
+                 }
+-                if (is_wait) {
+-                    kv->kvswap_dio_wait(atoi(t->name + sizeof(pfx_wait) - 1));
++                if (is_pred) {
++                    kv->kvswap_predict(atoi(t->name + sizeof(pfx_pred) - 1), t);
++                } else if (is_qcur) {
++                    kv->kvswap_eval_q(atoi(t->name + sizeof(pfx_qcur) - 1), t);
++                } else if (is_wait) {
++                    const int il = atoi(t->name + sizeof(pfx_wait) - 1);
++                    kv->kvswap_dio_wait(il);
++                    kv->kvswap_attn_prep(il);
+                 } else {
+                     const int il = atoi(t->name + sizeof(pfx_attn) - 1);
++                    kv->kvswap_attn_done(il);
+                     kv->kvswap_dio_done(il);
+                     kv->kvswap_prefetch(il + 1);
+                 }
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index b67d162..92512bb 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-graph.h"
++#include "llama-kvswap.h"
+ 
+ #include "llama-impl.h"
+ #include "llama-model.h"
+@@ -2658,6 +2659,13 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+         ggml_prec_set_acc(cur, GGML_PREC_F32);
+ 
++        // KVSwap with -nkvo (weights on the GPU, KV in host memory): keep the attention on the CPU, where the KV and the
++        // per-layer mask edits live. Without this the scheduler runs FLASH_ATTN on the GPU, copies the whole KV view over
++        // every layer and uploads the mask only once per graph, so per-layer selections would never reach it.
++        if (!cparams.offload_kqv && llama_kvswap_cfg::get().selecting()) {
++            ggml_backend_sched_set_tensor_backend(sched, cur, backend_cpu);
++        }
++
+         if (v_mla) {
+ #if 0
+             // v_mla can be applied as a matrix-vector multiplication with broadcasting across dimension 3 == n_tokens.
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 03709d2..0fe9f72 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -4,6 +4,7 @@
+ #include "llama-io.h"
+ #include "llama-kvswap.h"
+ #include "llama-kvswap-io.h"
++#include "llama-kvswap-pred.h"
+ #include "llama-model.h"
+ #include "llama-context.h"
+ 
+@@ -396,6 +397,27 @@ llama_kv_cache::llama_kv_cache(
+                 ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+     }
+ 
++    // KVSwap stage 2: low-rank key adapter
++    if (llama_kvswap_cfg::get().predicting() && swa_type == LLAMA_SWA_TYPE_NONE && !other && !layers.empty()) {
++        if (type_k != GGML_TYPE_F16 && type_k != GGML_TYPE_F32) {
++            throw std::runtime_error("KVSwap predictor needs an F16 or F32 K cache");
++        }
++        std::vector<uint32_t> il_of;
++        for (const auto & l : layers) {
++            il_of.push_back(l.il);
++        }
++        auto pred = std::make_shared<llama_kvswap_pred>();
++        std::string err;
++        if (!pred->load(llama_kvswap_cfg::get().adapter, il_of, (uint32_t) layers[0].k->ne[0], err)) {
++            throw std::runtime_error("KVSwap adapter: " + err);
++        }
++        LLAMA_LOG_INFO("%s: KVSwap predictor: adapter %s, rank %u (sigma %u), M=%u G=%u W=%u%s%s\n", __func__,
++                llama_kvswap_cfg::get().adapter.c_str(), pred->r, pred->d/pred->r, llama_kvswap_cfg::get().select_m,
++                llama_kvswap_cfg::get().group, llama_kvswap_cfg::get().window,
++                llama_kvswap_cfg::get().pred_same ? ", same-layer input" : "", llama_kvswap_cfg::get().pred_eval ? ", eval" : "");
++        kvpred = std::move(pred);
++    }
++
+     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+     if (other) {
+         n_embd_head_k_all = other->n_embd_head_k_all;
+@@ -1370,9 +1392,14 @@ void llama_kv_cache::kvdio_rows(uint32_t ci, uint32_t a, uint32_t b, size_t & of
+     len_v = (size_t) (b - a)*layer.v->nb[1];
+ }
+ 
++const std::vector<std::pair<uint32_t, uint32_t>> & llama_kv_cache::kvdio_load(uint32_t ci) const {
++    const auto & st = kvdio_st;
++    return st.pred && ci < st.load_set.size() && st.load_set[ci] ? st.load_l[ci] : st.load;
++}
++
+ void llama_kv_cache::kvdio_issue(uint32_t ci) const {
+     size_t ok, lk, ov, lv;
+-    for (const auto & r : kvdio_st.load) {
++    for (const auto & r : kvdio_load(ci)) {
+         kvdio_rows(ci, r.first, r.second, ok, lk, ov, lv);
+         kvdio->submit_read((int) ci, ok, lk);
+         kvdio->submit_read((int) ci, ov, lv);
+@@ -1391,6 +1418,9 @@ void llama_kv_cache::kvdio_begin(uint32_t p0, uint32_t p1, bool decode, uint32_t
+     st.p1     = p1;
+     st.load   = std::move(load);
+     st.issued = 0;
++    st.pred   = kvpred && decode && kvswap_sel_now;
++    st.load_l.assign(layers.size(), {});
++    st.load_set.assign(layers.size(), 0);
+     st.waited.assign(layers.size(), 0);
+     st.done.assign(layers.size(), 0);
+ 
+@@ -1430,9 +1460,10 @@ void llama_kv_cache::kvdio_begin(uint32_t p0, uint32_t p1, bool decode, uint32_t
+         kvdio_lo = recent0;
+     }
+ 
+-    // layer 0 is needed right away, the following ones overlap with the computation of the layers before them
++    // layer 0 is needed right away, the following ones overlap with the computation of the layers before them.
++    // With the predictor every layer is issued by kvswap_predict() once its groups are known.
+     const uint32_t depth = llama_kvswap_cfg::get().io_depth;
+-    while (st.issued <= depth && st.issued < layers.size()) {
++    while (!st.pred && st.issued <= depth && st.issued < layers.size()) {
+         kvdio_issue(st.issued++);
+     }
+ }
+@@ -1473,7 +1504,7 @@ void llama_kv_cache::kvswap_dio_done(int32_t il) const {
+             abort();
+         }
+         // the cells read for this layer are no longer needed
+-        for (const auto & r : st.load) {
++        for (const auto & r : kvdio_load(ci)) {
+             kvdio_rows(ci, r.first, r.second, ok, lk, ov, lv);
+             kvdio->evict(ok, lk);
+             kvdio->evict(ov, lv);
+@@ -1491,7 +1522,7 @@ void llama_kv_cache::kvswap_dio_done(int32_t il) const {
+         kvdio->write_sync(ov, lv);
+     }
+ 
+-    if (st.decode) {
++    if (st.decode && !st.pred) {
+         const uint32_t depth = llama_kvswap_cfg::get().io_depth;
+         while (st.issued < layers.size() && st.issued <= ci + depth + 1) {
+             kvdio_issue(st.issued++);
+@@ -1510,7 +1541,7 @@ void llama_kv_cache::kvswap_dio_end() const {
+         size_t ok, lk, ov, lv;
+         for (uint32_t ci = 0; ci < st.issued && ci < layers.size(); ++ci) {
+             if (!st.done[ci]) {
+-                for (const auto & r : st.load) {
++                for (const auto & r : kvdio_load(ci)) {
+                     kvdio_rows(ci, r.first, r.second, ok, lk, ov, lv);
+                     kvdio->evict(ok, lk);
+                     kvdio->evict(ov, lv);
+@@ -1527,6 +1558,330 @@ void llama_kv_cache::kvswap_dio_end() const {
+     st.active = false;
+ }
+ 
++// KVSwap stage 2 helpers ------------------------------------------------------------------------------------------
++
++// row c of a 2-D F16/F32 cache tensor as floats
++static void kvswap_row_f32(const ggml_tensor * t, uint32_t c, float * out) {
++    const char * row = (const char *) t->data + (size_t) c*t->nb[1];
++    if (t->type == GGML_TYPE_F16) {
++        ggml_fp16_to_fp32_row((const ggml_fp16_t *) row, out, t->ne[0]);
++    } else {
++        memcpy(out, row, (size_t) t->ne[0]*sizeof(float));
++    }
++}
++
++// a query node ([hd, n_head, 1] F32) as host floats, head-major. With -ngl the node is computed on the GPU and its
++// data is not host memory, so it is copied out.
++static void kvswap_q_host(const ggml_tensor * q, std::vector<float> & out) {
++    const size_t hd = (size_t) q->ne[0], nh = (size_t) q->ne[1];
++    out.resize(hd*nh);
++    if (q->buffer && !ggml_backend_buffer_is_host(q->buffer)) {
++        if (ggml_is_contiguous(q)) {
++            ggml_backend_tensor_get(q, out.data(), 0, hd*nh*sizeof(float));
++        } else {
++            for (size_t h = 0; h < nh; ++h) {
++                ggml_backend_tensor_get(q, out.data() + h*hd, h*q->nb[1], hd*sizeof(float));
++            }
++        }
++        return;
++    }
++    for (size_t h = 0; h < nh; ++h) {
++        memcpy(out.data() + h*hd, (const char *) q->data + h*q->nb[1], hd*sizeof(float));
++    }
++}
++
++// set mask cells [a, b) of the first row to v (0 or -inf)
++static void kvswap_mask_set(ggml_tensor * m, uint32_t a, uint32_t b, float v) {
++    b = std::min<uint32_t>(b, (uint32_t) m->ne[0]);
++    if (m->type == GGML_TYPE_F16) {
++        const ggml_fp16_t h = ggml_fp32_to_fp16(v);
++        std::fill((ggml_fp16_t *) m->data + a, (ggml_fp16_t *) m->data + b, h);
++    } else {
++        std::fill((float *) m->data + a, (float *) m->data + b, v);
++    }
++}
++
++// put cache layer ci's predicted groups into the shared mask, closing the ones of the layer before
++static void kvswap_mask_apply(llama_kvswap_pred & P, ggml_tensor * mask, uint32_t ci) {
++    for (const auto & rg : P.mask_open) {
++        kvswap_mask_set(mask, rg.first, rg.second, -INFINITY);
++    }
++    P.mask_open.clear();
++    if (P.has_sel[ci]) {
++        for (const auto & rg : P.sel[ci]) {
++            kvswap_mask_set(mask, rg.first, rg.second, 0.0f);
++        }
++        P.mask_open = P.sel[ci];
++    }
++    P.mask_ci = (int32_t) ci;
++}
++
++static inline float kvswap_dot(const float * a, const float * b, uint32_t n) {
++    float s = 0.0f;
++    for (uint32_t i = 0; i < n; ++i) {
++        s += a[i]*b[i];
++    }
++    return s;
++}
++
++void llama_kv_cache::kvswap_predict(int32_t il, const ggml_tensor * q) const {
++    if (!kvpred || !kvswap_sel_now) {
++        return;
++    }
++    const auto it = map_layer_ids.find(il);
++    if (it == map_layer_ids.end()) {
++        return;
++    }
++    const uint32_t ci = it->second;
++    auto & P = *kvpred;
++    if (q->type != GGML_TYPE_F32 || q->ne[2] != 1 || P.klr[ci].empty()) {
++        return;
++    }
++    const int64_t t0 = ggml_time_us();
++    const auto & kc = llama_kvswap_cfg::get();
++    const uint32_t G  = kc.group;
++    const uint32_t g0 = kc.sink_groups;
++    const uint32_t g1 = kvswap_recent0/G;   // groups entirely before the recent window
++    const uint32_t r  = P.r;
++    (void) r;
++
++    // Q^: sum the query heads that share a KV head, laid out like a K cache row
++    const uint32_t hd = (uint32_t) q->ne[0], n_head = (uint32_t) q->ne[1], n_head_kv = P.d/hd;
++    std::vector<float> qh(P.d, 0.0f), ql(r), qv;
++    kvswap_q_host(q, qv);
++    for (uint32_t h = 0; h < n_head; ++h) {
++        const float * qr = qv.data() + (size_t) h*hd;
++        float * dst = qh.data() + (size_t) (h/(n_head/n_head_kv))*hd;
++        for (uint32_t j = 0; j < hd; ++j) {
++            dst[j] += qr[j];
++        }
++    }
++    P.project(ci, qh.data(), ql.data());
++
++    // group score = max over the group's cells of K_lr . q_lr
++    std::vector<std::pair<float, uint32_t>> cand;
++    cand.reserve(g1 > g0 ? g1 - g0 : 0);
++    if (g1 > g0) {
++        std::vector<float> sc((size_t) (g1 - g0)*G);
++        P.scores(ci, ql.data(), g0*G, g1*G, sc.data());
++        for (uint32_t g = g0; g < g1; ++g) {
++            const float * s = sc.data() + (size_t) (g - g0)*G;
++            cand.emplace_back(*std::max_element(s, s + G), g);
++        }
++    }
++    if (cand.size() > kc.select_m) {
++        std::nth_element(cand.begin(), cand.begin() + kc.select_m, cand.end(),
++                [](const auto & x, const auto & y) { return x.first > y.first; });
++        cand.resize(kc.select_m);
++    }
++    P.sel_groups.clear();
++    for (const auto & c : cand) {
++        P.sel_groups.push_back(c.second);
++    }
++    std::sort(P.sel_groups.begin(), P.sel_groups.end());
++    P.track_reuse(ci, P.sel_groups);
++    auto & ranges = P.sel[ci];
++    ranges.clear();
++    for (uint32_t g : P.sel_groups) {
++        if (!ranges.empty() && ranges.back().second == g*G) {
++            ranges.back().second = (g + 1)*G;
++        } else {
++            ranges.emplace_back(g*G, (g + 1)*G);
++        }
++    }
++    P.has_sel[ci] = 1;
++    if (kvswap_mask && (ci == 0 || P.attn_done[ci - 1])) {
++        kvswap_mask_apply(P, kvswap_mask, ci);   // no-look-ahead layer: the previous attention is already done
++    }
++
++    if (kvdio && kvdio_st.active && kvdio_st.pred) {
++        // direct I/O: read this layer's groups now; with look-ahead this overlaps the previous layer's compute
++        auto & st = kvdio_st;
++        if (st.issued == ci) {
++            auto & L = st.load_l[ci];
++            L = st.load;   // sink groups (sorted, all before g0*G)
++            for (const auto & rg : ranges) {
++                if (!L.empty() && L.back().second == rg.first) {
++                    L.back().second = rg.second;
++                } else {
++                    L.push_back(rg);
++                }
++            }
++            st.load_set[ci] = 1;
++            kvdio_issue(ci);
++            st.issued = ci + 1;
++        }
++    } else if (kc.prefetch && !kvswap_maps.empty()) {
++        const auto & layer = layers[ci];
++        for (const auto & rg : ranges) {
++            llama_kvswap_willneed((const char *) layer.k->data + (size_t) rg.first*layer.k->nb[1], (size_t) (rg.second - rg.first)*layer.k->nb[1]);
++            llama_kvswap_willneed((const char *) layer.v->data + (size_t) rg.first*layer.v->nb[1], (size_t) (rg.second - rg.first)*layer.v->nb[1]);
++        }
++    }
++    P.n_pred++;
++    P.t_pred_s += (ggml_time_us() - t0)*1e-6;
++}
++
++void llama_kv_cache::kvswap_eval_q(int32_t il, const ggml_tensor * q) const {
++    if (!kvpred || !llama_kvswap_cfg::get().pred_eval) {
++        return;
++    }
++    const auto it = map_layer_ids.find(il);
++    if (it != map_layer_ids.end() && q->type == GGML_TYPE_F32 && q->ne[2] == 1) {
++        // the last "Qcur-<il>" before the attention is the roped one; copy it now, the buffer may be reused
++        auto & P = *kvpred;
++        kvswap_q_host(q, P.qx[it->second]);
++        P.qx_hd = (uint32_t) q->ne[0];
++        P.qx_nh = (uint32_t) q->ne[1];
++        P.has_qx[it->second] = 1;
++    }
++}
++
++void llama_kv_cache::kvswap_attn_prep(int32_t il) const {
++    if (!kvpred) {
++        return;
++    }
++    const auto it = map_layer_ids.find(il);
++    if (it == map_layer_ids.end()) {
++        return;
++    }
++    const uint32_t ci = it->second;
++    auto & P = *kvpred;
++    const auto & layer = layers[ci];
++    const auto & kc = llama_kvswap_cfg::get();
++    const uint32_t r = P.r, d = P.d, G = kc.group;
++    const uint32_t kv_size = (uint32_t) layer.k->ne[1];
++
++    // 1. low-rank keys of the cells this ubatch wrote (they are resident right now in every mode)
++    {
++        const int64_t t0 = ggml_time_us();
++        if (P.klr[ci].empty()) {
++            P.kv_size = kv_size;
++            P.klr[ci].assign((size_t) kv_size*r, 0.0f);
++        }
++        std::vector<float> row(d), y(r);
++        for (uint32_t c = kvswap_p0; c < kvswap_p1 && c < kv_size; ++c) {
++            kvswap_row_f32(layer.k, c, row.data());
++            P.project(ci, row.data(), y.data());
++            for (uint32_t j = 0; j < r; ++j) {
++                P.klr[ci][(size_t) j*kv_size + c] = y[j];
++            }
++        }
++        P.t_klr_s += (ggml_time_us() - t0)*1e-6;
++    }
++
++    if (!kvswap_sel_now) {
++        return;
++    }
++
++    // 2. evaluation against the exact attention (needs every old K row in RAM)
++    if (kc.pred_eval && P.has_qx[ci] && !kvdio) {
++        P.has_qx[ci] = 0;
++        const float * qv = P.qx[ci].data();
++        const uint32_t N = kvswap_N, recent0 = kvswap_recent0;
++        const uint32_t hd = P.qx_hd, n_head = P.qx_nh, ratio = n_head/(d/hd);
++        const float scale = 1.0f/sqrtf((float) hd);
++        std::vector<float> logit((size_t) n_head*N), row(d);
++        for (uint32_t c = 0; c < N; ++c) {
++            kvswap_row_f32(layer.k, c, row.data());
++            for (uint32_t h = 0; h < n_head; ++h) {
++                const float * qr = qv + (size_t) h*hd;
++                logit[(size_t) h*N + c] = scale*kvswap_dot(qr, row.data() + (size_t) (h/ratio)*hd, hd);
++            }
++        }
++        std::vector<double> imp(N, 0.0);
++        for (uint32_t h = 0; h < n_head; ++h) {
++            float * l = logit.data() + (size_t) h*N;
++            const float mx = *std::max_element(l, l + N);
++            double sum = 0.0;
++            for (uint32_t c = 0; c < N; ++c) {
++                sum += std::exp((double) (l[c] - mx));
++            }
++            for (uint32_t c = 0; c < N; ++c) {
++                imp[c] += std::exp((double) (l[c] - mx))/sum/n_head;
++            }
++        }
++        const uint32_t g0 = kc.sink_groups, g1 = recent0/G;
++        double base = 0.0;
++        for (uint32_t c = 0; c < N; ++c) {
++            if (c < g0*G || c >= recent0) {
++                base += imp[c];
++            }
++        }
++        std::vector<std::pair<double, uint32_t>> gs;
++        for (uint32_t g = g0; g < g1; ++g) {
++            double m = 0.0;
++            for (uint32_t c = g*G; c < (g + 1)*G; ++c) {
++                m += imp[c];
++            }
++            gs.emplace_back(m, g);
++        }
++        const uint32_t M = std::min<uint32_t>(kc.select_m, (uint32_t) gs.size());
++        std::vector<double> gmass(g1 + 1, 0.0);
++        for (const auto & x : gs) {
++            gmass[x.second] = x.first;
++        }
++        // predicted
++        double pred = 0.0;
++        std::vector<uint8_t> is_pred(g1 + 1, 0);
++        if (P.has_sel[ci]) {
++            for (const auto & rg : P.sel[ci]) {
++                for (uint32_t g = rg.first/G; g < rg.second/G && g < g1; ++g) {
++                    pred += gmass[g];
++                    is_pred[g] = 1;
++                }
++            }
++        }
++        // oracle top-M
++        std::nth_element(gs.begin(), gs.begin() + M, gs.end(), [](const auto & x, const auto & y) { return x.first > y.first; });
++        double oracle = 0.0;
++        uint32_t hit = 0;
++        for (uint32_t k = 0; k < M; ++k) {
++            oracle += gs[k].first;
++            hit += is_pred[gs[k].second];
++        }
++        // stage-1 uniform selection over all groups, only the picks outside sink and window count
++        double unif = 0.0;
++        const uint32_t ng = (N + G - 1)/G;
++        std::vector<uint8_t> is_unif(g1 + 1, 0);
++        for (uint32_t k = 0; k < kc.select_m; ++k) {
++            const uint32_t g = (uint32_t) ((uint64_t) k*ng/kc.select_m);
++            if (g >= g0 && g < g1 && !is_unif[g]) {
++                is_unif[g] = 1;
++                unif += gmass[g];
++            }
++        }
++        auto & a = P.acc[ci];
++        a.base   += base;
++        a.pred   += base + pred;
++        a.oracle += base + oracle;
++        a.unif   += base + unif;
++        a.recall += M ? (double) hit/M : 1.0;
++        a.n++;
++    }
++
++    // 3. normally done already (kvswap_attn_done / kvswap_predict); fallback, e.g. when no prediction arrived
++    if (kvswap_mask && P.mask_ci != (int32_t) ci) {
++        kvswap_mask_apply(P, kvswap_mask, ci);
++    }
++}
++
++void llama_kv_cache::kvswap_attn_done(int32_t il) const {
++    if (!kvpred || !kvswap_sel_now) {
++        return;
++    }
++    const auto it = map_layer_ids.find(il);
++    if (it == map_layer_ids.end()) {
++        return;
++    }
++    const uint32_t ci = it->second;
++    auto & P = *kvpred;
++    P.attn_done[ci] = 1;
++    if (kvswap_mask && ci + 1 < P.has_sel.size() && P.has_sel[ci + 1]) {
++        kvswap_mask_apply(P, kvswap_mask, ci + 1);   // look-ahead layer: its groups were chosen during layer ci
++    }
++}
++
+ void llama_kv_cache::kvswap_flush() {
+     if (!kvswap_dirty) {
+         return;
+@@ -2080,6 +2435,17 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+     // so the flash-attention kernel skips (and never faults in) every other cell.
+     // Stage 1b (direct I/O) also needs to know which groups have to be read back from the file.
+     kvswap_sel.clear();
++    kvswap_mask    = dst;
++    kvswap_sel_now = false;
++    kvswap_p0      = (uint32_t) ubatch->pos[0];
++    kvswap_p1      = kvswap_p0 + ubatch->n_tokens;
++    if (kvpred) {
++        GGML_ASSERT(n_stream == 1 && "KVSwap predictor needs a single sequence");
++        kvpred->has_sel.assign(kvpred->has_sel.size(), 0);
++        kvpred->attn_done.assign(kvpred->attn_done.size(), 0);
++        kvpred->mask_open.clear();   // the mask is rebuilt below
++        kvpred->mask_ci = -1;
++    }
+     if (n_tps > 1 && !kvswap_maps.empty()) {
+         kvswap_dirty = true;
+     }
+@@ -2103,7 +2469,8 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+                 for (uint32_t g = 0; g < kcfg.sink_groups && g < ng; ++g) {
+                     keep_g[g] = 1;
+                 }
+-                for (uint32_t k = 0; k < kcfg.select_m; ++k) {
++                // with the predictor the M groups are chosen per layer while the graph runs (kvswap_predict)
++                for (uint32_t k = 0; k < kcfg.select_m && !kvpred; ++k) {
+                     keep_g[(int64_t) k*ng/kcfg.select_m] = 1;
+                 }
+             }
+@@ -2126,6 +2493,9 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+                 }
+             }
+             if (s == 0) {
++                kvswap_N       = (uint32_t) N;
++                kvswap_recent0 = (uint32_t) recent0;
++                kvswap_sel_now = sel;
+                 if (kvdio) {
+                     dio_recent0 = (uint32_t) recent0;
+                     for (int64_t g = 0; g < ng && (g + 1)*G <= recent0; ++g) {
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 315a210..1bcc8fd 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -167,6 +167,13 @@ public:
+     void kvswap_dio_done(int32_t il) const;   // after the attention of layer il: flush new groups, evict the rest
+     void kvswap_dio_end()  const;             // after the whole ubatch has been computed
+ 
++    // KVSwap stage 2 (predictor, llama-kvswap-pred.h). No-ops unless LLAMA_KV_ADAPTER is set.
++    bool kvswap_pred_enabled() const { return kvpred != nullptr; }
++    void kvswap_predict(int32_t il, const ggml_tensor * q) const;   // "kvswap_q-<il>": choose layer il's groups, issue reads
++    void kvswap_eval_q (int32_t il, const ggml_tensor * q) const;   // "Qcur-<il>": exact Q for LLAMA_KV_PRED_EVAL
++    void kvswap_attn_prep(int32_t il) const;                        // right before layer il's attention: K_lr, eval, mask
++    void kvswap_attn_done(int32_t il) const;                        // after layer il's attention: write layer il+1's mask
++
+     uint32_t get_size()     const;
+     uint32_t get_n_stream() const;
+ 
+@@ -318,8 +325,19 @@ private:
+     // KVSwap stage 1b: staging memory + file + reader threads (null = disabled)
+     std::shared_ptr<struct llama_kvswap_dio> kvdio;
+ 
++    // KVSwap stage 2: predictor state, and what set_input_kq_mask() decided for the current ubatch
++    std::shared_ptr<struct llama_kvswap_pred> kvpred;
++    mutable ggml_tensor * kvswap_mask = nullptr;   // the kq_mask of the current ubatch (host buffer, shared by all layers)
++    mutable uint32_t kvswap_p0 = 0, kvswap_p1 = 0; // cells written by the current ubatch
++    mutable uint32_t kvswap_N = 0;                 // cells visible to the current decode step
++    mutable uint32_t kvswap_recent0 = 0;           // first cell of the recent window
++    mutable bool     kvswap_sel_now = false;       // the current ubatch is a decode step with selection active
++
+     struct kvdio_state {
+         bool     active = false;   // between kvdio_begin() and kvswap_dio_end() of one ubatch
++        bool     pred   = false;   // per-layer loads chosen by the predictor (load_l), issued from kvswap_predict()
++        std::vector<std::vector<std::pair<uint32_t, uint32_t>>> load_l;
++        std::vector<uint8_t> load_set;
+         bool     decode = false;   // single-token ubatch: only a selected subset of old cells is brought into RAM
+         uint32_t p0 = 0;           // first position written by this ubatch
+         uint32_t p1 = 0;           // one past the last position written by this ubatch
+@@ -334,6 +352,7 @@ private:
+     void kvdio_begin(uint32_t p0, uint32_t p1, bool decode, uint32_t recent0,
+             std::vector<std::pair<uint32_t, uint32_t>> && load) const;
+     void kvdio_issue(uint32_t ci) const;                       // submit the reads of cache layer ci
++    const std::vector<std::pair<uint32_t, uint32_t>> & kvdio_load(uint32_t ci) const;   // cells cache layer ci reads
+     void kvdio_rows(uint32_t ci, uint32_t a, uint32_t b, size_t & off_k, size_t & len_k, size_t & off_v, size_t & len_v) const;
+ 
+     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
+diff --git a/src/llama-kvswap-pred.h b/src/llama-kvswap-pred.h
+new file mode 100644
+index 0000000..0b1d458
+--- /dev/null
++++ b/src/llama-kvswap-pred.h
+@@ -0,0 +1,224 @@
++#pragma once
++
++// KVSwap stage 2 (PajamaParties): low-rank key predictor.
++//
++// The adapter A (scripts/make_kvswap_adapter.py) maps a K cache row k (n_embd_k_gqa values) to r values k_lr = A k.
++// K_lr is kept in RAM for every cell. For layer i the graph computes an approximate query q~ from the input of layer i-1
++// (node "kvswap_q-<i>"); the host sums it over the query heads of each KV head (Q^, n_embd_k_gqa values), projects it
++// (q_lr = A Q^) and scores every old cell with K_lr q_lr, which approximates the head-summed attention logit Q^ . k.
++// The top M groups by group-max score are read for layer i, in addition to the sink groups and the recent window.
++//
++//   LLAMA_KV_ADAPTER     GGUF adapter file (tensors "kvswap.A.<il>", ne = [n_embd_k_gqa, r]); with LLAMA_KV_SELECT = M
++//                        it replaces the fixed uniform selection of stage 1 by the prediction
++//   LLAMA_KV_PRED_SAME   1 = predict layer i from its own input (no look-ahead, isolates the low-rank error)
++//   LLAMA_KV_PRED_EXACT  N = layers 0..N-1 use their own input, like the paper does for the first two layers
++//                        (default 2; 1 = look-ahead from layer 1 on). Their reads are not overlapped with compute.
++//   LLAMA_KV_PRED_EVAL   1 = also compute the exact attention of every layer (RAM-resident KV only) and report how much
++//                        attention mass the predicted, the oracle top-M and the stage-1 uniform selections keep
++
++#include "ggml.h"
++#include "gguf.h"
++
++#include <cmath>
++#include <cstdint>
++#include <cstdio>
++#include <string>
++#include <utility>
++#include <vector>
++
++struct llama_kvswap_pred {
++    uint32_t r = 0;   // adapter rank
++    uint32_t d = 0;   // n_embd_k_gqa
++
++    std::vector<std::vector<float>> At;    // [cache layer] d*r, transposed adapter: At[i*r + j] = A[j][i]
++    std::vector<std::vector<float>> klr;   // [cache layer] r*kv_size, dimension-major: klr[j*kv_size + c]
++    uint32_t kv_size = 0;
++    std::vector<uint32_t>           il_of; // cache layer -> model layer
++
++    // predicted cell ranges [a, b) of the current decode step, per cache layer (sink and window not included)
++    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> sel;
++    std::vector<uint8_t> has_sel;
++    std::vector<uint32_t> sel_groups;   // scratch
++
++    // ranges the predictor has opened (set to 0) in the shared kq_mask, and whose selection that is
++    std::vector<std::pair<uint32_t, uint32_t>> mask_open;
++    int32_t mask_ci = -1;
++    // attention of a cache layer has finished in the current ubatch. The mask for layer i is written once layer i-1's
++    // attention is done and layer i's selection is known: with -ngl the scheduler copies the mask into the CPU split
++    // when the split starts, so writing it right before the attention (inside the split) would be too late.
++    std::vector<uint8_t> attn_done;
++
++    // exact roped Q per cache layer, copied out for LLAMA_KV_PRED_EVAL ([n_head][hd] floats)
++    std::vector<std::vector<float>> qx;
++    std::vector<uint8_t> has_qx;
++    uint32_t qx_hd = 0, qx_nh = 0;
++
++    // evaluation accumulators, per cache layer
++    struct acc_t {
++        double base = 0, pred = 0, oracle = 0, unif = 0, recall = 0;
++        uint64_t n = 0;
++    };
++    std::vector<acc_t> acc;
++
++    uint64_t n_pred = 0;
++    double   t_pred_s = 0, t_klr_s = 0;
++
++    // reuse between decode steps (always on with the predictor, printed at exit as kvswap_reuse): fraction of this step's groups selected 1 / within 4 / within 16 steps ago
++    std::vector<std::vector<int64_t>> last_step;   // [cache layer][group] last step the group was selected, -1 = never
++    std::vector<int64_t> n_step;                   // [cache layer] decode steps predicted so far
++    struct reuse_t { double h1 = 0, h4 = 0, h16 = 0; uint64_t n = 0; };
++    std::vector<reuse_t> reuse;
++
++    void track_reuse(uint32_t ci, const std::vector<uint32_t> & groups) {
++        if (last_step.empty()) {
++            last_step.resize(il_of.size());
++            n_step.assign(il_of.size(), 0);
++            reuse.resize(il_of.size());
++        }
++        auto & ls = last_step[ci];
++        const int64_t t = n_step[ci]++;
++        uint32_t h1 = 0, h4 = 0, h16 = 0;
++        for (uint32_t g : groups) {
++            if (g >= ls.size()) {
++                ls.resize(g + 1, -1);
++            }
++            const int64_t age = ls[g] < 0 ? INT64_MAX : t - ls[g];
++            h1 += age <= 1; h4 += age <= 4; h16 += age <= 16;
++            ls[g] = t;
++        }
++        if (t > 0 && !groups.empty()) {
++            auto & R = reuse[ci];
++            R.h1 += (double) h1/groups.size(); R.h4 += (double) h4/groups.size(); R.h16 += (double) h16/groups.size();
++            R.n++;
++        }
++    }
++
++    bool load(const std::string & path, const std::vector<uint32_t> & il_of_ci, uint32_t n_embd_k_gqa, std::string & err) {
++        ggml_context * meta = nullptr;
++        gguf_init_params p = { /*.no_alloc =*/ false, /*.ctx =*/ &meta };
++        gguf_context * g = gguf_init_from_file(path.c_str(), p);
++        if (!g) {
++            err = "cannot read " + path;
++            return false;
++        }
++        bool ok = true;
++        d = n_embd_k_gqa;
++        il_of = il_of_ci;
++        At.resize(il_of.size());
++        for (size_t ci = 0; ci < il_of.size() && ok; ++ci) {
++            const std::string name = "kvswap.A." + std::to_string(il_of[ci]);
++            ggml_tensor * t = ggml_get_tensor(meta, name.c_str());
++            if (!t || t->type != GGML_TYPE_F32 || t->ne[0] != (int64_t) d || t->ne[2] != 1) {
++                err = "tensor " + name + " missing, not F32 or not [" + std::to_string(d) + ", r]";
++                ok = false;
++                break;
++            }
++            if (r == 0) {
++                r = (uint32_t) t->ne[1];
++            } else if (t->ne[1] != (int64_t) r) {
++                err = "tensor " + name + " has a different rank";
++                ok = false;
++                break;
++            }
++            const float * a = (const float *) t->data;
++            At[ci].resize((size_t) d*r);
++            for (uint32_t j = 0; j < r; ++j) {
++                for (uint32_t i = 0; i < d; ++i) {
++                    At[ci][(size_t) i*r + j] = a[(size_t) j*d + i];
++                }
++            }
++        }
++        gguf_free(g);
++        ggml_free(meta);
++        if (!ok) {
++            return false;
++        }
++        const size_t n = il_of.size();
++        klr.resize(n);
++        sel.resize(n);
++        has_sel.assign(n, 0);
++        attn_done.assign(n, 0);
++        qx.resize(n);
++        has_qx.assign(n, 0);
++        acc.resize(n);
++        return true;
++    }
++
++    // y[j] = sum_i A[j][i] x[i]; the inner loop runs over j so it vectorizes without reassociating a reduction
++    void project(uint32_t ci, const float * x, float * y) const {
++        const float * at = At[ci].data();
++        for (uint32_t j = 0; j < r; ++j) {
++            y[j] = 0.0f;
++        }
++        for (uint32_t i = 0; i < d; ++i) {
++            const float xi = x[i];
++            const float * row = at + (size_t) i*r;
++            for (uint32_t j = 0; j < r; ++j) {
++                y[j] += row[j]*xi;
++            }
++        }
++    }
++
++    // score[c] = K_lr[c] . q_lr for c in [c0, c1); dimension-major K_lr, inner loop over cells
++    void scores(uint32_t ci, const float * ql, uint32_t c0, uint32_t c1, float * out) const {
++        const uint32_t n = c1 - c0;
++        for (uint32_t c = 0; c < n; ++c) {
++            out[c] = 0.0f;
++        }
++        const float * k = klr[ci].data();
++        for (uint32_t j = 0; j < r; ++j) {
++            const float * kj = k + (size_t) j*kv_size + c0;
++            const float qj = ql[j];
++            for (uint32_t c = 0; c < n; ++c) {
++                out[c] += kj[c]*qj;
++            }
++        }
++    }
++
++    void report() const {
++        uint64_t n_all = 0;
++        acc_t tot;
++        for (const auto & a : acc) {
++            tot.base += a.base; tot.pred += a.pred; tot.oracle += a.oracle; tot.unif += a.unif; tot.recall += a.recall;
++            n_all += a.n;
++        }
++        if (n_pred == 0) {
++            return;   // e.g. a short-lived context that never decoded
++        }
++        fprintf(stderr, "kvswap_pred: rank=%u steps*layers=%llu predict_ms/step=%.3f klr_update_s=%.3f\n", r,
++                (unsigned long long) n_pred, n_pred ? 1e3*t_pred_s/n_pred*il_of.size() : 0.0, t_klr_s);
++        if (!reuse.empty()) {
++            reuse_t T;
++            for (const auto & R : reuse) { T.h1 += R.h1; T.h4 += R.h4; T.h16 += R.h16; T.n += R.n; }
++            if (T.n) {
++                fprintf(stderr, "kvswap_reuse: samples=%llu prev1=%.4f within4=%.4f within16=%.4f\n", (unsigned long long) T.n,
++                        T.h1/T.n, T.h4/T.n, T.h16/T.n);
++                for (size_t ci = 0; ci < reuse.size(); ++ci) {
++                    const auto & R = reuse[ci];
++                    if (R.n) {
++                        fprintf(stderr, "kvswap_reuse: layer %2u prev1=%.4f within4=%.4f within16=%.4f\n", il_of[ci],
++                                R.h1/R.n, R.h4/R.n, R.h16/R.n);
++                    }
++                }
++            }
++        }
++        if (n_all == 0) {
++            return;
++        }
++        // attention mass kept (averaged over heads, layers and steps): sink+window only, + predicted, + oracle, + uniform
++        fprintf(stderr, "kvswap_pred_eval: samples=%llu mass_base=%.4f mass_pred=%.4f mass_oracle=%.4f mass_uniform=%.4f "
++                "group_recall=%.4f\n", (unsigned long long) n_all, tot.base/n_all, tot.pred/n_all, tot.oracle/n_all,
++                tot.unif/n_all, tot.recall/n_all);
++        for (size_t ci = 0; ci < acc.size(); ++ci) {
++            const auto & a = acc[ci];
++            if (a.n) {
++                fprintf(stderr, "kvswap_pred_eval: layer %2u base=%.4f pred=%.4f oracle=%.4f uniform=%.4f recall=%.4f\n",
++                        il_of[ci], a.base/a.n, a.pred/a.n, a.oracle/a.n, a.unif/a.n, a.recall/a.n);
++            }
++        }
++    }
++
++    ~llama_kvswap_pred() {
++        report();
++    }
++};
+diff --git a/src/llama-kvswap.h b/src/llama-kvswap.h
+index ead70e3..4853cda 100644
+--- a/src/llama-kvswap.h
++++ b/src/llama-kvswap.h
+@@ -18,6 +18,8 @@
+ //   LLAMA_KV_IO_CHUNK_KB   max bytes per read request in KiB, default 1024
+ //   LLAMA_KV_IO_DEPTH      layers loaded ahead of the layer being computed, default 1 (0 = only the current layer)
+ //   LLAMA_KV_DEBUG         N > 0 = log resident KV bytes (mincore) every N decode steps
++//
++// Stage 2 (predictor): LLAMA_KV_ADAPTER, LLAMA_KV_PRED_SAME, LLAMA_KV_PRED_EVAL, see llama-kvswap-pred.h
+ 
+ #include <algorithm>
+ #include <cstdint>
+@@ -46,6 +48,10 @@ struct llama_kvswap_cfg {
+     uint32_t io_chunk_kb = 1024;
+     uint32_t io_depth   = 1;
+     uint32_t debug_every = 0;
++    std::string adapter;            // stage 2 predictor (llama-kvswap-pred.h)
++    bool     pred_same  = false;
++    bool     pred_eval  = false;
++    uint32_t pred_exact = 2;        // layers [0, pred_exact) choose from their own input (no look-ahead)
+ 
+     static const llama_kvswap_cfg & get() {
+         static const llama_kvswap_cfg cfg = [] {
+@@ -68,6 +74,12 @@ struct llama_kvswap_cfg {
+             c.io_chunk_kb = std::max<uint32_t>(4, geti("LLAMA_KV_IO_CHUNK_KB", 1024));
+             c.io_depth    = geti("LLAMA_KV_IO_DEPTH", 1);
+             c.debug_every = geti("LLAMA_KV_DEBUG", 0);
++            if (const char * a = getenv("LLAMA_KV_ADAPTER")) {
++                c.adapter = a;
++            }
++            c.pred_same   = geti("LLAMA_KV_PRED_SAME", 0) != 0;
++            c.pred_eval   = geti("LLAMA_KV_PRED_EVAL", 0) != 0;
++            c.pred_exact  = std::max<uint32_t>(1, geti("LLAMA_KV_PRED_EXACT", 2));
+             return c;
+         }();
+         return cfg;
+@@ -75,6 +87,7 @@ struct llama_kvswap_cfg {
+ 
+     bool file_backed() const { return !path.empty(); }
+     bool selecting()   const { return select_m > 0; }
++    bool predicting()  const { return select_m > 0 && !adapter.empty(); }
+ };
+ 
+ // owns a file mapping; unmaps and closes on destruction
+diff --git a/src/models/qwen3.cpp b/src/models/qwen3.cpp
+index f4b2a2a..7b4d4ae 100644
+--- a/src/models/qwen3.cpp
++++ b/src/models/qwen3.cpp
+@@ -1,4 +1,5 @@
+ #include "models.h"
++#include "llama-kvswap.h"
+ 
+ void llama_model_qwen3::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+@@ -68,6 +69,32 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
+ 
+     ggml_tensor * inp_out_ids = build_inp_out_ids();
+ 
++    // KVSwap stage 2: approximate query of layer `il_t` from `x` (attn_norm + Q projection + q_norm + RoPE of layer il_t).
++    // The host reads node "kvswap_q-<il_t>" to choose and start loading layer il_t's KV groups (llama-kvswap-pred.h).
++    const auto & kvs = llama_kvswap_cfg::get();
++    const bool kvs_pred = kvs.predicting() && n_tokens == 1;
++    auto kvs_build_q = [&](int il_t, ggml_tensor * x, bool normed) {
++        const auto & lt = model.layers[il_t];
++        ggml_tensor * xn = normed ? x : build_norm(x, lt.attn_norm, NULL, LLM_NORM_RMS, il_t);
++        ggml_tensor * q;
++        if (lt.wqkv) {
++            q = build_lora_mm(lt.wqkv, xn, lt.wqkv_s);
++            q = ggml_cont(ctx0, ggml_view_2d(ctx0, q, n_embd_head*n_head, n_tokens, q->nb[1], 0));
++        } else {
++            q = build_lora_mm(lt.wq, xn, lt.wq_s);
++        }
++        if (lt.wq_b) {
++            q = ggml_add(ctx0, q, lt.wq_b);
++        }
++        q = ggml_reshape_3d(ctx0, q, n_embd_head, n_head, n_tokens);
++        q = build_norm(q, lt.attn_q_norm, NULL, LLM_NORM_RMS, il_t);
++        q = ggml_rope_ext(ctx0, q, inp_pos, nullptr,
++                n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
++                ext_factor, attn_factor, beta_fast, beta_slow);
++        cb(q, "kvswap_q", il_t);
++        ggml_build_forward_expand(gf, q);
++    };
++
+     for (int il = 0; il < n_layer; ++il) {
+         res->t_layer_inp[il] = inpL;
+ 
+@@ -79,6 +106,16 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
+                 LLM_NORM_RMS, il);
+         cb(cur, "attn_norm", il);
+ 
++        if (kvs_pred) {
++            const int n_exact = (int) kvs.pred_exact;   // >= 1: layer 0 has no previous layer
++            if (kvs.pred_same || il < n_exact) {
++                kvs_build_q(il, cur, true);         // own input: exact query (low-rank error only)
++            }
++            if (!kvs.pred_same && il + 1 < n_layer && il + 1 >= n_exact) {
++                kvs_build_q(il + 1, inpL, false);   // look-ahead: layer il+1's weights on layer il's input
++            }
++        }
++
+         // self-attention
+         {
+             // compute Q and K and RoPE them

@@ -1,0 +1,24 @@
+scenario,key_resource,key_setting,other_setting,heat_ratio,tpot_ratio,ttft_ratio,other_job_tpot_ratio,feasible,source
+gpu_only,GPU,1000,A720 default,0.991,0.996,1.000,,yes (no gain),thermal_ab_gpu_20261118
+gpu_only,GPU,1000,A720 800,1.062,0.997,0.996,,yes (worse heat),thermal_ab_gpu_20261118
+gpu_only,GPU,800,A720 default,1.088,1.204,1.209,,no (speed),thermal_ab_gpu_20261118
+gpu_only,GPU,800,A720 800,1.098,1.205,1.214,,no (speed),thermal_ab_gpu_20261118
+gpu_only,GPU,600,A720 default,1.131,1.571,1.575,,no (speed),thermal_ab_gpu_20261118
+gpu_only,GPU,600,A720 800,1.170,1.573,1.581,,no (speed),thermal_ab_gpu_20261118
+gpu_only,GPU,350,A720 default,1.442,2.614,2.644,,no (speed),thermal_ab_gpu_20261118
+gpu_only,GPU,350,A720 800,1.489,2.617,2.640,,no (speed),thermal_ab_gpu_20261118
+co_run,GPU,1000,A720 default,1.007,0.999,1.012,1.007,yes (no gain),thermal_ab_co_20261118
+co_run,GPU,1000,A720 1500,0.738,0.828,0.969,1.118,no (CPU job TPOT 1.118 > 1.10; yes if limit 1.15),thermal_ab_co_20261118
+co_run,GPU,1000,A720 800,0.809,0.768,0.989,2.464,no (CPU job speed),thermal_ab_co_20261118
+co_run,GPU,600,A720 default,1.017,1.418,1.497,0.987,no (GPU job speed),thermal_ab_co_20261118
+co_run,GPU,600,A720 1500,0.746,1.224,1.470,1.108,no (GPU job speed),thermal_ab_co_20261118
+co_run,GPU,600,A720 800,0.827,1.195,1.577,2.474,no (speed),thermal_ab_co_20261118
+cpu_only,A720,default (prefill and decode),KV swap,0.869,0.901,1.041,,yes,thermal_ab_20261113
+cpu_only,A720,default (prefill and decode),KV swap (11/14 rerun),0.903,0.896,1.042,,yes,thermal_ab_phase_20261114
+cpu_only,A720,decode only 1500,KV RAM,0.874,1.052,1.003,,yes,thermal_ab_phase_20261114
+cpu_only,A720,decode only 1500,KV swap (n=1),0.904,1.026,1.044,,yes (no extra gain; n=1 superseded by 11/21 rerun),thermal_ab_phase_20261114
+cpu_only,A720,decode only 1500,KV swap (11/21 rerun n=2; heat = 0.903 x same-batch ratio 0.952 to KV swap default; post-first-token 0.78-0.84 of it),0.860,1.025,1.044,,yes (gain after the first token),kvphase_ab_20261121
+cpu_only,A720,all 1500,KV RAM,0.714,1.053,1.506,,no (TTFT),thermal_ab_20261113
+cpu_only,A720,all 1500,KV swap,0.613,1.033,1.552,,no (TTFT),thermal_ab_20261113
+cpu_only,A720,all 1200,KV RAM,0.705,1.146,1.843,,no (TPOT and TTFT),thermal_ab_20261113
+cpu_only,A720,all 1200,KV swap,0.645,1.165,1.893,,no (TPOT and TTFT),thermal_ab_20261113

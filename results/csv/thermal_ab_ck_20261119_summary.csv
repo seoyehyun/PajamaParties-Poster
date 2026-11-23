@@ -1,0 +1,5 @@
+config,n,kv,mhz,gpu_mhz_mean,tpot_ms,vs_naive_tpot,prefill_s,vs_naive_ttft,total_s,vs_naive_total,switch_error_s,dT_ss,heat_area_per_tok,heat_area_min,heat_area_max,vs_naive_heat,peak_c,max_cooling_state,quality,tail_complete,window_ok,cpu_tpot_ms,vs_naive_cpu_tpot,gpu_tpot_ms,vs_naive_gpu_tpot,heat_post_per_tok,vs_naive_heat_post,verdict
+ck_ram_gdef_cdef,2,ram,gpu default / a720 default,445.2,81.19,1,333.3,1,576.8,1,,7.151,2.873,2.672,3.074,1,72,0,1,1,1,,,75.64,,1.494,,baseline
+ck_ram_g1000_c1500,2,ram,gpu 1000 / a720 1500,907,86.55,1.066,501.6,1.505,761.1,1.32,,7.69,2.047,1.944,2.15,0.7125,61,0,1,1,1,,,70.98,0.9384,1.081,0.7238,heat lower but TTFT too long
+ck_swap_g1000_cdef,2,swap,gpu 1000 / a720 default,864.9,67.76,0.8347,347.4,1.042,550.6,0.9547,,8.523,2.589,2.544,2.634,0.9011,67,0,0.9448,1,1,,,60.67,0.802,1.137,0.7608,no clear gain (within noise)
+ck_swap_g1000_c1500,2,swap,gpu 1000 / a720 1500,872.8,78.17,0.9628,517.6,1.553,752,1.304,,10.51,1.865,1.801,1.929,0.6491,59,0,0.9448,1,1,,,58.51,0.7735,0.8606,0.5761,heat lower but TTFT too long

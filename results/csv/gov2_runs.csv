@@ -1,0 +1,5 @@
+config,rep,prefill_s,decode_s,tokens,cpu_tokens,gpu_tokens,gpu_bursts_n,gpu_overlap_s,tpot_ms,gpu_tpot_ms,cpu_Bps_on,cpu_Bps_off,cpu_on_s,cpu_off_s,heat_zone8_per_tok,heat_post_zone8_per_tok,heat_post_zone8_total,peak_c,tail_complete,cpu_util_a720_d,gpu_busy_d,disk_rd_MBps_d,read_GBps_a720_d,bus_GBps_a720_d,bus_GBps_a520_d
+ck_ram_gdef_cdef,1,332.6,603.8,8596,6499,2097,3,424.6,92.91,88.43,38.22,39.77,424.6,181.7,3.83,2.83,2.433e+04,73,0,0.9491,0.5367,0.06157,,,
+ck_swap_gdef_cdef,1,346.4,428.8,8596,6499,2097,3,291.7,65.98,58.54,60.12,63.66,291.3,139.6,2.394,1.426,1.226e+04,70,1,0.801,0.5415,15.34,,,
+ck_swap_gdef_d1500,1,346.5,497.8,8596,6499,2097,3,263,76.6,52.57,51.54,54.03,263.2,237.7,1.849,0.9245,7947,66,1,0.818,0.4247,13.06,,,
+ck_swap_gov,1,346.4,498.3,8596,6499,2097,3,263.3,76.67,52.71,51.46,53.99,263.7,237.7,1.848,0.9157,7871,66,1,0.8181,0.4253,13.07,,,

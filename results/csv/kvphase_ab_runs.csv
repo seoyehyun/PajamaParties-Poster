@@ -1,0 +1,5 @@
+config,rep,tpot_ms,prefill_s,decode_s,heat_per_tok_zone8,heat_prefill_Cs,heat_decode_Cs,heat_post_Cs,heat_post_per_tok,T_zone8_last60s_decode_C,tail_complete
+kv_default,1,67.24,346.8,134.4,6.394,8550,3343,4184,2.093,64.3,0
+kvphase_1500,1,76.68,347.8,153.3,5.903,8701,2469,3054,1.528,54.7,1
+kvphase_1500,2,76.78,347.0,153.5,5.983,8848,2477,3069,1.535,54.8,1
+kv_default,2,67.02,347.2,134.0,6.087,8479,3245,3637,1.82,63.9,1

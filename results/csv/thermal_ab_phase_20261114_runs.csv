@@ -1,0 +1,9 @@
+config,round,ttft_s,prefill_tokens,decode_s,decode_tokens,tpot_ms,total_s,heat_area_hot_per_tok,heat_area_allzones_mean_per_tok,dT_ss_hot,peak_c,max_cooling_state,tail_complete,switch_error_s,hot_zone
+naive,1,332.9,7013,149.3,1999,74.68,482.2,6.848,3.976,32.01,72.0,0,1,,thermal_zone8
+naive,2,332.8,7013,150.0,1999,75.06,482.9,6.771,3.896,31.11,71.0,0,1,,thermal_zone8
+kv_default,1,346.4,7013,134.0,1999,67.05,480.4,6.087,3.454,25.76,67.0,0,1,,thermal_zone8
+kv_default,2,347.0,7013,134.2,1999,67.13,481.2,6.217,3.625,25.9,66.0,0,1,,thermal_zone8
+kv_1500,1,517.3,7013,153.8,1999,76.91,671.0,4.061,2.651,15.23,57.0,0,1,,thermal_zone8
+phase_1500,1,333.0,7013,157.3,1999,78.67,490.3,5.977,3.461,19.95,67.0,0,1,-0.37,thermal_zone8
+phase_1500,2,334.5,7013,157.7,1999,78.9,492.2,5.928,3.417,19.62,66.0,0,1,-0.46,thermal_zone8
+kvphase_1500,1,347.4,7013,153.6,1999,76.82,501.0,6.158,3.807,17.34,66.0,0,1,-0.61,thermal_zone8

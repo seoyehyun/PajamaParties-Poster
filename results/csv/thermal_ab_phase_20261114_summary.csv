@@ -1,0 +1,6 @@
+config,n,kv,mhz,tpot_ms,vs_naive_tpot,prefill_s,vs_naive_ttft,total_s,vs_naive_total,switch_error_s,dT_ss,heat_area_per_tok,heat_area_min,heat_area_max,vs_naive_heat,peak_c,max_cooling_state,quality,tail_complete,window_ok,verdict
+naive,2,ram,default,74.87,1,332.8,1,482.5,1,,31.56,6.81,6.771,6.848,1,72,0,1,1,1,baseline
+kv_default,2,swap,default,67.09,0.896,346.7,1.042,480.8,0.9965,,25.83,6.152,6.087,6.217,0.9034,67,0,0.937,1,1,IMPROVED
+kv_1500,1,swap,1500,76.91,1.027,517.3,1.554,671,1.391,,15.23,4.061,4.061,4.061,0.5963,57,0,0.937,1,1,heat lower but TTFT too long
+phase_1500,2,ram,decode 1500,78.78,1.052,333.7,1.003,491.2,1.018,-0.4138,19.79,5.953,5.928,5.977,0.8741,67,0,1,1,1,IMPROVED
+kvphase_1500,1,swap,decode 1500,76.82,1.026,347.4,1.044,501,1.038,-0.612,17.34,6.158,6.158,6.158,0.9043,66,0,0.937,1,1,IMPROVED

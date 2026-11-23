@@ -1,0 +1,336 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 439beabdf..0140d399b 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,4 +1,6 @@
+ #include "llama-context.h"
++#include "llama-kvswap.h"
++#include "llama-kv-cache.h"
+ 
+ #include "ggml.h"
+ #include "llama-arch.h"
+@@ -1420,7 +1422,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         res->reset();
+ 
+         ggml_backend_sched_reset(sched.get());
+-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
++        if (cparams.cb_eval == nullptr && llama_kvswap_cfg::get().prefetch && llama_kvswap_cfg::get().selecting()) {
++            // KVSwap stage 1: after layer il's attention, advise the kernel about layer il+1's selected K/V ranges
++            ggml_backend_sched_set_eval_callback(sched.get(), [](struct ggml_tensor * t, bool ask, void * ud) -> bool {
++                static const char   pfx[] = "kqv_out-";
++                const bool is_attn = strncmp(t->name, pfx, sizeof(pfx) - 1) == 0;
++                if (ask) {
++                    return is_attn;
++                }
++                if (is_attn) {
++                    auto * kv = dynamic_cast<llama_kv_cache *>(((llama_context *) ud)->get_memory());
++                    if (kv) {
++                        kv->kvswap_prefetch(atoi(t->name + sizeof(pfx) - 1) + 1);
++                    }
++                }
++                return true;
++            }, this);
++        } else {
++            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
++        }
+ 
+         //const auto t_start_us = ggml_time_us();
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 1c93f908b..54d85c53d 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "llama-impl.h"
+ #include "llama-io.h"
++#include "llama-kvswap.h"
+ #include "llama-model.h"
+ #include "llama-context.h"
+ 
+@@ -281,6 +282,35 @@ llama_kv_cache::llama_kv_cache(
+             for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
+             }
++        } else if (llama_kvswap_cfg::get().file_backed() && ggml_backend_buft_is_host(buft)) {
++            // KVSwap stage 1: back the KV tensors with a file instead of anonymous memory
++            const size_t sz = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
++            auto map = std::make_shared<llama_kvswap_map>();
++            std::string path = llama_kvswap_cfg::get().path;
++            if (!kvswap_maps.empty()) {
++                path += "." + std::to_string(kvswap_maps.size());
++            }
++            if (!map->open(path, sz)) {
++                throw std::runtime_error("failed to map kv offload file: " + path);
++            }
++            buf = ggml_backend_cpu_buffer_from_ptr(map->addr, sz);
++            if (!buf) {
++                throw std::runtime_error("failed to wrap kv offload mapping");
++            }
++            ggml_tallocr talloc = ggml_tallocr_new(buf);
++            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
++                if (t->view_src != nullptr) {
++                    ggml_backend_view_init(t); // per-stream views alias the base tensors
++                    continue;
++                }
++                if (ggml_tallocr_alloc(&talloc, t) != GGML_STATUS_SUCCESS) {
++                    throw std::runtime_error("failed to place kv tensor in offload mapping");
++                }
++            }
++            LLAMA_LOG_INFO("%s: KV cache backed by file %s (%.2f MiB, M=%u G=%u W=%u prefetch=%d)\n", __func__,
++                    path.c_str(), sz/1024.0/1024.0, llama_kvswap_cfg::get().select_m,
++                    llama_kvswap_cfg::get().group, llama_kvswap_cfg::get().window, (int) llama_kvswap_cfg::get().prefetch);
++            kvswap_maps.push_back(std::move(map));
+         } else {
+             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+         }
+@@ -290,7 +320,10 @@ llama_kv_cache::llama_kv_cache(
+ 
+         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+ 
+-        ggml_backend_buffer_clear(buf, 0);
++        // a fresh sparse file already reads back as zero; memset would dirty the whole file
++        if (kvswap_maps.empty()) {
++            ggml_backend_buffer_clear(buf, 0);
++        }
+         ctxs_bufs.emplace_back(std::move(ctx), buf);
+     }
+ 
+@@ -372,7 +405,7 @@ void llama_kv_cache::clear(bool data) {
+         v_heads[s] = 0;
+     }
+ 
+-    if (data) {
++    if (data && kvswap_maps.empty()) {
+         for (auto & [_, buf] : ctxs_bufs) {
+             ggml_backend_buffer_clear(buf.get(), 0);
+         }
+@@ -1247,6 +1280,26 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
+     return v_cells[seq_to_stream[seq_id]];
+ }
+ 
++void llama_kv_cache::kvswap_prefetch(int32_t il) const {
++    if (kvswap_sel.empty()) {
++        return;
++    }
++    auto it = map_layer_ids.find(il);
++    if (it == map_layer_ids.end()) {
++        return;
++    }
++    const auto & layer = layers[it->second];
++    for (ggml_tensor * t : { layer.k, layer.v }) {
++        if (!t) {
++            continue;
++        }
++        const size_t row = t->nb[1];
++        for (const auto & r : kvswap_sel) {
++            llama_kvswap_willneed((const char *) t->data + (size_t) r.first*row, (size_t) (r.second - r.first)*row);
++        }
++    }
++}
++
+ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+     uint32_t result = 0;
+ 
+@@ -1782,6 +1835,51 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+     }
+ 
++    // KVSwap stage 1: during decoding keep only sink groups + M evenly spaced groups + the recent window,
++    // so the flash-attention kernel skips (and never faults in) every other cell
++    kvswap_sel.clear();
++    const auto & kcfg = llama_kvswap_cfg::get();
++    if (kcfg.selecting() && n_tps == 1 && swa_type == LLAMA_SWA_TYPE_NONE) {
++        const bool f16 = dst->type == GGML_TYPE_F16;
++        const uint32_t G = kcfg.group;
++        for (int64_t s = 0; s < n_stream; ++s) {
++            const int64_t N = (int64_t) ubatch->pos[s] + 1; // tokens visible to this decode step
++            if (N <= (int64_t) kcfg.window + (int64_t) G*(kcfg.select_m + kcfg.sink_groups)) {
++                continue; // short context: read everything
++            }
++            const int64_t ng = (N + G - 1)/G;
++            std::vector<char> keep_g(ng, 0);
++            for (uint32_t g = 0; g < kcfg.sink_groups && g < ng; ++g) {
++                keep_g[g] = 1;
++            }
++            for (uint32_t k = 0; k < kcfg.select_m; ++k) {
++                keep_g[(int64_t) k*ng/kcfg.select_m] = 1;
++            }
++            const int64_t recent0 = std::max<int64_t>(0, N - (int64_t) kcfg.window);
++            std::vector<std::pair<uint32_t, uint32_t>> ranges;
++            for (int64_t j = 0; j < n_kv; ++j) {
++                const bool keep = j < N && (j >= recent0 || keep_g[j/G]);
++                if (keep) {
++                    if (!ranges.empty() && ranges.back().second == (uint32_t) j) {
++                        ranges.back().second = (uint32_t) j + 1;
++                    } else {
++                        ranges.emplace_back((uint32_t) j, (uint32_t) j + 1);
++                    }
++                }
++                if (!keep) {
++                    if (f16) {
++                        ((ggml_fp16_t *) dst->data)[s*n_kv + j] = llama_cast<ggml_fp16_t>(-INFINITY);
++                    } else {
++                        ((float *) dst->data)[s*n_kv + j] = -INFINITY;
++                    }
++                }
++            }
++            if (s == 0) {
++                kvswap_sel = std::move(ranges);
++            }
++        }
++    }
++
+     //const int64_t t_end = ggml_time_us();
+ 
+     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 5051f4343..5d471c439 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -155,6 +155,9 @@ public:
+     // llama_kv_cache specific API
+     //
+ 
++    // KVSwap stage 1: advise the kernel that the selected K/V ranges of layer il will be read soon
++    void kvswap_prefetch(int32_t il) const;
++
+     uint32_t get_size()     const;
+     uint32_t get_n_stream() const;
+ 
+@@ -294,6 +297,12 @@ private:
+     // ggml contexts for the KV cache along with the allocated backend buffers:
+     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+ 
++    // KVSwap stage 1: file mappings backing the buffers above (see llama-kvswap.h)
++    std::vector<std::shared_ptr<struct llama_kvswap_map>> kvswap_maps;
++
++    // cell ranges [first, last) chosen for the current decode step (merged, sorted); empty = no selection
++    mutable std::vector<std::pair<uint32_t, uint32_t>> kvswap_sel;
++
+     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
+     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
+     std::vector<uint32_t> v_heads;
+diff --git a/src/llama-kvswap.h b/src/llama-kvswap.h
+new file mode 100644
+index 000000000..859e3df74
+--- /dev/null
++++ b/src/llama-kvswap.h
+@@ -0,0 +1,117 @@
++#pragma once
++
++// KVSwap stage-1 prototype (PajamaParties): file-backed KV cache + fixed cell selection.
++// All knobs are read from environment variables so no public API changes are needed.
++//
++//   LLAMA_KV_OFFLOAD_PATH  file to back the KV cache (mmap, MAP_SHARED). unset = disabled
++//   LLAMA_KV_SELECT        number of groups M to read per decode step (0 = read everything)
++//   LLAMA_KV_GROUP         group size G in cells (default 8)
++//   LLAMA_KV_WINDOW        recent window W in cells, always kept (default 256)
++//   LLAMA_KV_SINK_GROUPS   leading groups always kept (default 4)
++//   LLAMA_KV_PREFETCH      1 = posix_madvise(WILLNEED) next layer's selected ranges
++
++#include <algorithm>
++#include <cstdint>
++#include <cstdlib>
++#include <memory>
++#include <string>
++#include <utility>
++#include <vector>
++
++#if defined(__unix__) || defined(__APPLE__)
++#include <fcntl.h>
++#include <sys/mman.h>
++#include <unistd.h>
++#define LLAMA_KVSWAP_POSIX 1
++#endif
++
++struct llama_kvswap_cfg {
++    std::string path;
++    uint32_t select_m   = 0;
++    uint32_t group      = 8;
++    uint32_t window     = 256;
++    uint32_t sink_groups = 4;
++    bool     prefetch   = false;
++
++    static const llama_kvswap_cfg & get() {
++        static const llama_kvswap_cfg cfg = [] {
++            llama_kvswap_cfg c;
++            auto geti = [](const char * k, uint32_t d) {
++                const char * v = getenv(k);
++                return v ? (uint32_t) strtoul(v, nullptr, 10) : d;
++            };
++            if (const char * p = getenv("LLAMA_KV_OFFLOAD_PATH")) {
++                c.path = p;
++            }
++            c.select_m    = geti("LLAMA_KV_SELECT", 0);
++            c.group       = std::max<uint32_t>(1, geti("LLAMA_KV_GROUP", 8));
++            c.window      = geti("LLAMA_KV_WINDOW", 256);
++            c.sink_groups = geti("LLAMA_KV_SINK_GROUPS", 4);
++            c.prefetch    = geti("LLAMA_KV_PREFETCH", 0) != 0;
++            return c;
++        }();
++        return cfg;
++    }
++
++    bool file_backed() const { return !path.empty(); }
++    bool selecting()   const { return select_m > 0; }
++};
++
++// owns a file mapping; unmaps and closes on destruction
++struct llama_kvswap_map {
++    void * addr = nullptr;
++    size_t size = 0;
++    int    fd   = -1;
++
++    llama_kvswap_map() = default;
++    llama_kvswap_map(const llama_kvswap_map &) = delete;
++    llama_kvswap_map & operator=(const llama_kvswap_map &) = delete;
++
++    bool open(const std::string & path, size_t sz) {
++#ifdef LLAMA_KVSWAP_POSIX
++        fd = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
++        if (fd < 0) {
++            return false;
++        }
++        // sparse file: unwritten pages read back as zero, so no memset is needed
++        if (ftruncate(fd, (off_t) sz) != 0) {
++            return false;
++        }
++        addr = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
++        if (addr == MAP_FAILED) {
++            addr = nullptr;
++            return false;
++        }
++        size = sz;
++        // we control group-wise reads ourselves, so disable kernel readahead
++        posix_madvise(addr, sz, POSIX_MADV_RANDOM);
++        return true;
++#else
++        (void) path; (void) sz;
++        return false;
++#endif
++    }
++
++    ~llama_kvswap_map() {
++#ifdef LLAMA_KVSWAP_POSIX
++        if (addr) {
++            munmap(addr, size);
++        }
++        if (fd >= 0) {
++            ::close(fd);
++        }
++#endif
++    }
++};
++
++// madvise(WILLNEED) over [ptr, ptr+len), rounded out to page boundaries
++inline void llama_kvswap_willneed(const void * ptr, size_t len) {
++#ifdef LLAMA_KVSWAP_POSIX
++    static const uintptr_t pg = (uintptr_t) sysconf(_SC_PAGESIZE);
++    uintptr_t b = (uintptr_t) ptr & ~(pg - 1);
++    uintptr_t e = ((uintptr_t) ptr + len + pg - 1) & ~(pg - 1);
++    posix_madvise((void *) b, e - b, POSIX_MADV_WILLNEED);
++#else
++    (void) ptr; (void) len;
++#endif
++}

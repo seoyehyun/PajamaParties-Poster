@@ -1,0 +1,8 @@
+config,n,kv,mhz,gpu_mhz_mean,tpot_ms,vs_naive_tpot,prefill_s,vs_naive_ttft,total_s,vs_naive_total,switch_error_s,dT_ss,heat_area_per_tok,heat_area_min,heat_area_max,vs_naive_heat,peak_c,max_cooling_state,quality,tail_complete,window_ok,cpu_tpot_ms,vs_naive_cpu_tpot,verdict
+co_gdef_cdef,2,ram,gpu default / a720 default,470,75.95,1,102.2,1,178,1,,32.17,1.703,1.66,1.747,1,74,0,1,1,1,40.27,,baseline
+co_g1000_cdef,2,ram,gpu 1000 / a720 default,719.3,75.84,0.9986,103.4,1.012,179.1,1.006,,32.24,1.716,1.714,1.717,1.007,73,0,1,1,1,40.53,1.007,no clear gain (within noise)
+co_g1000_c1500,2,ram,gpu 1000 / a720 1500,779,62.91,0.8283,99.03,0.9694,161.9,0.9093,,19.51,1.257,1.256,1.258,0.7381,61,0,1,1,1,45.03,1.118,heat lower but TOO SLOW
+co_g1000_c800,2,ram,gpu 1000 / a720 800,914.6,58.35,0.7683,101,0.9889,159.3,0.8949,,9.952,1.378,1.375,1.38,0.8089,56,0,1,1,1,99.21,2.464,heat lower but TOO SLOW
+co_g600_cdef,2,ram,gpu 600 / a720 default,448.7,107.7,1.418,153,1.497,260.6,1.464,,10.04,1.732,1.706,1.757,1.017,74,0,1,1,1,39.76,0.9873,no clear gain (within noise)
+co_g600_c1500,2,ram,gpu 600 / a720 1500,458.3,92.99,1.224,150.1,1.47,243,1.365,,20.27,1.27,1.268,1.272,0.7458,60,0,1,1,1,44.6,1.108,heat lower but TOO SLOW
+co_g600_c800,2,ram,gpu 600 / a720 800,546.2,90.72,1.195,161.1,1.577,251.7,1.414,,10.14,1.408,1.398,1.418,0.8266,54,0,1,1,1,99.62,2.474,heat lower but TOO SLOW

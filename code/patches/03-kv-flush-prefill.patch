@@ -1,0 +1,98 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index f770e6845..e3fc43203 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1828,6 +1828,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     }
+     embd_seq.clear();
+ 
++    // KVSwap stage 1: flush prefill writes here, before the timer starts, so writeback neither competes
++    // with decode reads nor gets counted in the decode time
++    if (n_tokens_all == 1) {
++        if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
++            kv->kvswap_flush();
++        }
++    }
++
+     if (t_compute_start_us == 0) {
+         t_compute_start_us = ggml_time_us();
+     }
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 7b7b285ae..03709d258 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1527,6 +1527,20 @@ void llama_kv_cache::kvswap_dio_end() const {
+     st.active = false;
+ }
+ 
++void llama_kv_cache::kvswap_flush() {
++    if (!kvswap_dirty) {
++        return;
++    }
++    kvswap_dirty = false;
++    const int64_t t_start_us = ggml_time_us();
++    for (const auto & map : kvswap_maps) {
++        if (!map->sync()) {
++            LLAMA_LOG_WARN("%s: msync failed, prefill writeback may overlap decode reads\n", __func__);
++        }
++    }
++    LLAMA_LOG_INFO("%s: flushed prefill writes in %.1f ms\n", __func__, (ggml_time_us() - t_start_us)/1000.0);
++}
++
+ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+     uint32_t result = 0;
+ 
+@@ -2066,6 +2080,9 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
+     // so the flash-attention kernel skips (and never faults in) every other cell.
+     // Stage 1b (direct I/O) also needs to know which groups have to be read back from the file.
+     kvswap_sel.clear();
++    if (n_tps > 1 && !kvswap_maps.empty()) {
++        kvswap_dirty = true;
++    }
+     const auto & kcfg = llama_kvswap_cfg::get();
+     std::vector<std::pair<uint32_t, uint32_t>> dio_load;
+     uint32_t dio_recent0 = 0;
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index f7bbbc772..315a21097 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -158,6 +158,9 @@ public:
+     // KVSwap stage 1: advise the kernel that the selected K/V ranges of layer il will be read soon
+     void kvswap_prefetch(int32_t il) const;
+ 
++    // KVSwap stage 1: write the KV pages dirtied by a multi-token batch back to the file (no-op otherwise)
++    void kvswap_flush();
++
+     // KVSwap stage 1b (direct I/O). All of these are no-ops unless the cache was built in direct-I/O mode.
+     bool kvswap_dio_enabled() const { return kvdio != nullptr; }
+     void kvswap_dio_wait(int32_t il) const;   // before the attention of layer il: its cells must be in RAM
+@@ -309,6 +312,9 @@ private:
+     // cell ranges [first, last) chosen for the current decode step (merged, sorted); empty = no selection
+     mutable std::vector<std::pair<uint32_t, uint32_t>> kvswap_sel;
+ 
++    // set when a multi-token batch has written to the mapping since the last kvswap_flush()
++    mutable bool kvswap_dirty = false;
++
+     // KVSwap stage 1b: staging memory + file + reader threads (null = disabled)
+     std::shared_ptr<struct llama_kvswap_dio> kvdio;
+ 
+diff --git a/src/llama-kvswap.h b/src/llama-kvswap.h
+index 08ba75d3a..ead70e32a 100644
+--- a/src/llama-kvswap.h
++++ b/src/llama-kvswap.h
+@@ -112,6 +112,15 @@ struct llama_kvswap_map {
+ #endif
+     }
+ 
++    // blocks until dirty pages have reached the file
++    bool sync() {
++#ifdef LLAMA_KVSWAP_POSIX
++        return addr == nullptr || msync(addr, size, MS_SYNC) == 0;
++#else
++        return true;
++#endif
++    }
++
+     ~llama_kvswap_map() {
+ #ifdef LLAMA_KVSWAP_POSIX
+         if (addr) {

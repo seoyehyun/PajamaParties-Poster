@@ -1,0 +1,61 @@
+case,depth,name,code,config,correct,first_digit_ok,n_prompt,exit,wall_s,mass_base,mass_pred,mass_oracle,mass_uniform,recall,output
+0,0.1,Mira,3254257,full,1,1,3673,0,76.1,,,,,,3254257.  The text above
+0,0.1,Mira,3254257,unif_m16,0,0,3673,0,76.2,,,,,,1234. The secret passcode for M
+0,0.1,Mira,3254257,pred_r128_m16,1,1,3673,0,79.3,,,,,,3254257.  The text above
+0,0.1,Mira,3254257,pred_r32_m16,1,1,3673,0,77.1,,,,,,3254257.  The text above
+1,0.1,Tobias,2058756,full,1,1,3566,0,73.4,,,,,,2058756.  Question: According
+1,0.1,Tobias,2058756,unif_m16,0,0,3566,0,73.1,,,,,,123456.  Question: According to
+1,0.1,Tobias,2058756,pred_r128_m16,1,1,3566,0,76.0,,,,,,2058756.  Question: According
+1,0.1,Tobias,2058756,pred_r32_m16,1,1,3566,0,74.1,,,,,,2058756.  Question: According
+2,0.1,Keiko,2978347,full,1,1,3583,0,73.7,,,,,,2978347. Question: According
+2,0.1,Keiko,2978347,unif_m16,0,0,3583,0,73.5,,,,,,1234. Question: According to the text
+2,0.1,Keiko,2978347,pred_r128_m16,1,1,3583,0,76.5,,,,,,2978347. Question: According
+2,0.1,Keiko,2978347,pred_r32_m16,1,1,3583,0,74.6,,,,,,2978347. Question: According
+3,0.3,Anselm,8541208,full,1,1,3514,0,71.7,,,,,,8541208.  Question: According
+3,0.3,Anselm,8541208,unif_m16,0,0,3514,0,71.8,,,,,,1234. Question: According to the text
+3,0.3,Anselm,8541208,pred_r128_m16,1,1,3514,0,74.6,,,,,,8541208.  Question: According
+3,0.3,Anselm,8541208,pred_r32_m16,1,1,3514,0,72.8,,,,,,8541208.  Question: According
+4,0.3,Priya,7368886,full,1,1,3642,0,75.2,,,,,,7368886.  The text above
+4,0.3,Priya,7368886,unif_m16,0,0,3642,0,75.2,,,,,,1234.  The text above states that the
+4,0.3,Priya,7368886,pred_r128_m16,1,1,3642,0,127.4,,,,,,7368886.  The text above
+4,0.3,Priya,7368886,pred_r32_m16,1,1,3642,0,75.9,,,,,,7368886.  The text above
+5,0.3,Dorian,2574702,full,1,1,3567,0,72.8,,,,,,2574702.  The text above
+5,0.3,Dorian,2574702,unif_m16,0,0,3567,0,72.9,,,,,,555.  Question: According to the text above
+5,0.3,Dorian,2574702,pred_r128_m16,1,1,3567,0,75.6,,,,,,2574702.  The text above
+5,0.3,Dorian,2574702,pred_r32_m16,1,1,3567,0,73.8,,,,,,2574702.  The text above
+6,0.5,Lucia,1475591,full,1,1,4045,0,86.2,,,,,,1475591.  The secret pass
+6,0.5,Lucia,1475591,unif_m16,0,1,4045,0,86.0,,,,,,1234. The secret passcode for Lucia
+6,0.5,Lucia,1475591,pred_r128_m16,1,1,4045,0,89.3,,,,,,1475591.  The secret pass
+6,0.5,Lucia,1475591,pred_r32_m16,1,1,4045,0,87.4,,,,,,1475591.  The secret pass
+7,0.5,Henrik,8260626,full,1,1,4415,0,97.1,,,,,,8260626.  The text above
+7,0.5,Henrik,8260626,unif_m16,0,0,4415,0,99.9,,,,,,1234.  Question: According to the text
+7,0.5,Henrik,8260626,pred_r128_m16,1,1,4415,0,100.6,,,,,,8260626. The secret pass
+7,0.5,Henrik,8260626,pred_r32_m16,1,1,4415,0,98.4,,,,,,8260626. Question: According
+8,0.5,Amara,1035333,full,1,1,3580,0,73.1,,,,,,1035333.  Question: According
+8,0.5,Amara,1035333,unif_m16,0,1,3580,0,110.5,,,,,,1234. The secret passcode for Am
+8,0.5,Amara,1035333,pred_r128_m16,1,1,3580,0,76.2,,,,,,1035333.  Question: According
+8,0.5,Amara,1035333,pred_r32_m16,1,1,3580,0,74.3,,,,,,1035333.  The text above
+9,0.7,Felix,8472357,full,1,1,3596,0,73.8,,,,,,8472357.  The text above
+9,0.7,Felix,8472357,unif_m16,0,0,3596,0,73.9,,,,,,1234.  Question: According to the text
+9,0.7,Felix,8472357,pred_r128_m16,1,1,3596,0,76.4,,,,,,8472357.  The text above
+9,0.7,Felix,8472357,pred_r32_m16,1,1,3596,0,74.7,,,,,,8472357.  The text above
+10,0.7,Mira,4837993,full,1,1,3970,0,84.2,,,,,,4837993. The secret pass
+10,0.7,Mira,4837993,unif_m16,0,0,3970,0,84.1,,,,,,1234. The secret passcode for M
+10,0.7,Mira,4837993,pred_r128_m16,1,1,3970,0,87.4,,,,,,4837993. The secret pass
+10,0.7,Mira,4837993,pred_r32_m16,1,1,3970,0,85.2,,,,,,4837993. The secret pass
+11,0.7,Tobias,2715087,full,1,1,3482,0,70.8,,,,,,2715087.  The text above
+11,0.7,Tobias,2715087,unif_m16,0,1,3482,0,70.8,,,,,,2001. Question: According to the text
+11,0.7,Tobias,2715087,pred_r128_m16,1,1,3482,0,73.6,,,,,,2715087.  The text above
+11,0.7,Tobias,2715087,pred_r32_m16,1,1,3482,0,71.7,,,,,,2715087.  The text above
+12,0.9,Keiko,1513214,full,1,1,3513,0,71.5,,,,,,1513214.  The text above
+12,0.9,Keiko,1513214,unif_m16,0,1,3513,0,71.6,,,,,,1234. The secret passcode for Ke
+12,0.9,Keiko,1513214,pred_r128_m16,1,1,3513,0,74.2,,,,,,1513214. Question: According
+12,0.9,Keiko,1513214,pred_r32_m16,1,1,3513,0,72.5,,,,,,1513214. Question: According
+13,0.9,Anselm,1426910,full,1,1,4105,0,87.9,,,,,,1426910. Question: According
+13,0.9,Anselm,1426910,unif_m16,0,1,4105,0,87.9,,,,,,1234. The secret passcode for An
+13,0.9,Anselm,1426910,pred_r128_m16,1,1,4105,0,91.3,,,,,,1426910. Question: According
+13,0.9,Anselm,1426910,pred_r32_m16,1,1,4105,0,89.1,,,,,,1426910. Question: According
+14,0.9,Priya,1154433,full,1,1,3920,0,82.8,,,,,,1154433.  Question: According
+14,0.9,Priya,1154433,unif_m16,0,1,3920,0,82.7,,,,,,1234. The secret passcode for Pri
+14,0.9,Priya,1154433,pred_r128_m16,1,1,3920,0,86.0,,,,,,1154433. Question: According
+14,0.9,Priya,1154433,pred_r32_m16,1,1,3920,0,83.8,,,,,,1154433. Question: According

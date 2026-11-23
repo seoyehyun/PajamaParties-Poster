@@ -1,0 +1,235 @@
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 0fe9f72fd..8531bd4ab 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1397,12 +1397,110 @@ const std::vector<std::pair<uint32_t, uint32_t>> & llama_kv_cache::kvdio_load(ui
+     return st.pred && ci < st.load_set.size() && st.load_set[ci] ? st.load_l[ci] : st.load;
+ }
+ 
++bool llama_kv_cache::kvdio_reuse() const {
++    const auto & kc = llama_kvswap_cfg::get();
++    return kc.reuse > 0 && kc.selecting() && kvdio_st.decode;
++}
++
+ void llama_kv_cache::kvdio_issue(uint32_t ci) const {
+     size_t ok, lk, ov, lv;
++    if (!kvdio_reuse()) {
++        for (const auto & r : kvdio_load(ci)) {
++            kvdio_rows(ci, r.first, r.second, ok, lk, ov, lv);
++            kvdio->submit_read((int) ci, ok, lk);
++            kvdio->submit_read((int) ci, ov, lv);
++        }
++        return;
++    }
++    // reuse buffer: read only the groups that are not resident, merging adjacent misses into one request
++    auto & st = kvdio_st;
++    const uint32_t G  = llama_kvswap_cfg::get().group;
++    const uint32_t gs = llama_kvswap_cfg::get().sink_groups;
++    if (st.rb_used.size() != layers.size()) {
++        st.rb_used.assign(layers.size(), {});
++        st.rb_n.assign(layers.size(), 0);
++    }
++    auto & used = st.rb_used[ci];
++    if (used.size() < (size_t) layers[ci].k->ne[1]/G) {
++        used.resize((size_t) layers[ci].k->ne[1]/G, -1);
++    }
++    const int64_t now = (int64_t) kvdio->steps;
++    uint32_t run0 = 0, run1 = 0;   // pending miss run [run0, run1) in groups
++    auto flush = [&]() {
++        if (run1 > run0) {
++            kvdio_rows(ci, run0*G, run1*G, ok, lk, ov, lv);
++            kvdio->submit_read((int) ci, ok, lk);
++            kvdio->submit_read((int) ci, ov, lv);
++        }
++        run0 = run1 = 0;
++    };
+     for (const auto & r : kvdio_load(ci)) {
+-        kvdio_rows(ci, r.first, r.second, ok, lk, ov, lv);
+-        kvdio->submit_read((int) ci, ok, lk);
+-        kvdio->submit_read((int) ci, ov, lv);
++        GGML_ASSERT(r.first % G == 0 && r.second % G == 0);
++        for (uint32_t g = r.first/G; g < r.second/G; ++g) {
++            const bool hit = used[g] >= 0;
++            if (g >= gs) {
++                (hit ? kvdio->reuse_hit : kvdio->reuse_miss)++;
++            }
++            if (hit) {
++                flush();
++            } else {
++                if (g >= gs) {
++                    st.rb_n[ci]++;
++                }
++                if (run1 == g) {
++                    run1 = g + 1;
++                } else {
++                    flush();
++                    run0 = g;
++                    run1 = g + 1;
++                }
++            }
++            used[g] = now;
++        }
++    }
++    flush();
++}
++
++void llama_kv_cache::kvdio_rb_forget(uint32_t g_from) const {
++    auto & st = kvdio_st;
++    const uint32_t gs = llama_kvswap_cfg::get().sink_groups;
++    for (size_t ci = 0; ci < st.rb_used.size(); ++ci) {
++        auto & used = st.rb_used[ci];
++        for (size_t g = g_from; g < used.size(); ++g) {
++            if (used[g] >= 0) {
++                used[g] = -1;
++                if (g >= gs) {
++                    st.rb_n[ci]--;
++                }
++            }
++        }
++    }
++}
++
++void llama_kv_cache::kvdio_rb_trim(uint32_t ci) const {
++    auto & st = kvdio_st;
++    const auto & kc = llama_kvswap_cfg::get();
++    if (ci >= st.rb_used.size() || st.rb_n[ci] <= kc.reuse) {
++        return;
++    }
++    auto & used = st.rb_used[ci];
++    const int64_t now = (int64_t) kvdio->steps;
++    std::vector<std::pair<int64_t, uint32_t>> old;   // (last use, group), groups not used by this step
++    for (uint32_t g = kc.sink_groups; g < used.size(); ++g) {
++        if (used[g] >= 0 && used[g] < now) {
++            old.emplace_back(used[g], g);
++        }
++    }
++    const size_t n_evict = std::min<size_t>(old.size(), st.rb_n[ci] - kc.reuse);
++    std::partial_sort(old.begin(), old.begin() + n_evict, old.end());
++    size_t ok, lk, ov, lv;
++    for (size_t i = 0; i < n_evict; ++i) {
++        const uint32_t g = old[i].second;
++        kvdio_rows(ci, g*kc.group, (g + 1)*kc.group, ok, lk, ov, lv);
++        kvdio->evict(ok, lk);
++        kvdio->evict(ov, lv);
++        used[g] = -1;
++        st.rb_n[ci]--;
+     }
+ }
+ 
+@@ -1441,6 +1539,7 @@ void llama_kv_cache::kvdio_begin(uint32_t p0, uint32_t p1, bool decode, uint32_t
+             // a multi-token ubatch after decoding (e.g. a second prompt) attends to everything: make it all resident again
+             readback(0, kvdio_lo);
+             kvdio_lo = 0;
++            kvdio_rb_forget(0);   // everything is resident as part of the window now
+         }
+         return;
+     }
+@@ -1450,6 +1549,7 @@ void llama_kv_cache::kvdio_begin(uint32_t p0, uint32_t p1, bool decode, uint32_t
+     if (recent0 < kvdio_lo) {
+         readback(recent0, kvdio_lo); // window moved backwards (cache was edited): the cells are in the file
+         kvdio_lo = recent0;
++        kvdio_rb_forget(recent0/llama_kvswap_cfg::get().group);
+     } else if (recent0 > kvdio_lo) {
+         // groups that slid out of the window were flushed when they completed: release their RAM
+         for (uint32_t ci = 0; ci < layers.size(); ++ci) {
+@@ -1503,11 +1603,15 @@ void llama_kv_cache::kvswap_dio_done(int32_t il) const {
+                             "supported in direct-I/O mode\n", __func__, il);
+             abort();
+         }
+-        // the cells read for this layer are no longer needed
+-        for (const auto & r : kvdio_load(ci)) {
+-            kvdio_rows(ci, r.first, r.second, ok, lk, ov, lv);
+-            kvdio->evict(ok, lk);
+-            kvdio->evict(ov, lv);
++        if (kvdio_reuse()) {
++            kvdio_rb_trim(ci);   // keep the most recently used groups up to the capacity
++        } else {
++            // the cells read for this layer are no longer needed
++            for (const auto & r : kvdio_load(ci)) {
++                kvdio_rows(ci, r.first, r.second, ok, lk, ov, lv);
++                kvdio->evict(ok, lk);
++                kvdio->evict(ov, lv);
++            }
+         }
+     }
+     st.done[ci] = 1;
+@@ -1539,7 +1643,7 @@ void llama_kv_cache::kvswap_dio_end() const {
+     if (st.decode) {
+         // layers whose attention hook never ran would leak their loaded pages
+         size_t ok, lk, ov, lv;
+-        for (uint32_t ci = 0; ci < st.issued && ci < layers.size(); ++ci) {
++        for (uint32_t ci = 0; ci < st.issued && ci < layers.size() && !kvdio_reuse(); ++ci) {
+             if (!st.done[ci]) {
+                 for (const auto & r : kvdio_load(ci)) {
+                     kvdio_rows(ci, r.first, r.second, ok, lk, ov, lv);
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index 1bcc8fd59..917dbbee0 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -345,6 +345,12 @@ private:
+         uint32_t issued = 0;       // layers [0, issued) have had their reads submitted
+         std::vector<uint8_t> waited;
+         std::vector<uint8_t> done;
++
++        // reuse buffer (LLAMA_KV_REUSE = capacity in groups per layer): old groups stay resident after their attention.
++        // rb_used[ci][g] = decode step that last used group g of cache layer ci, -1 = not resident (only in the file).
++        // Sink groups stay resident once read and do not count against the capacity. Persists across ubatches.
++        std::vector<std::vector<int64_t>> rb_used;
++        std::vector<uint32_t> rb_n;   // resident non-sink groups per cache layer
+     };
+     mutable kvdio_state kvdio_st;
+     mutable uint32_t    kvdio_lo = 0;   // cells [0, kvdio_lo) are NOT resident (only in the file)
+@@ -354,6 +360,9 @@ private:
+     void kvdio_issue(uint32_t ci) const;                       // submit the reads of cache layer ci
+     const std::vector<std::pair<uint32_t, uint32_t>> & kvdio_load(uint32_t ci) const;   // cells cache layer ci reads
+     void kvdio_rows(uint32_t ci, uint32_t a, uint32_t b, size_t & off_k, size_t & len_k, size_t & off_v, size_t & len_v) const;
++    bool kvdio_reuse() const;                                  // reuse buffer active for the current ubatch
++    void kvdio_rb_forget(uint32_t g_from) const;               // drop groups >= g_from from the buffer without evicting
++    void kvdio_rb_trim(uint32_t ci) const;                     // evict least recently used groups above the capacity
+ 
+     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
+     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method
+diff --git a/src/llama-kvswap-io.h b/src/llama-kvswap-io.h
+index 651f39f98..9970367e8 100644
+--- a/src/llama-kvswap-io.h
++++ b/src/llama-kvswap-io.h
+@@ -65,6 +65,8 @@ struct llama_kvswap_dio {
+     double   stall_s       = 0.0;          // time the compute thread waited for reads
+     double   write_s       = 0.0;
+     uint64_t steps         = 0;
++    uint64_t reuse_hit     = 0;            // reuse buffer: selected groups found resident / read from the file
++    uint64_t reuse_miss    = 0;            //   (sink groups not counted)
+ 
+     llama_kvswap_dio() = default;
+     llama_kvswap_dio(const llama_kvswap_dio &) = delete;
+@@ -138,6 +140,10 @@ struct llama_kvswap_dio {
+                     (unsigned long long) steps, bytes_read.load()/1048576.0, (unsigned long long) n_reads.load(),
+                     bytes_written/1048576.0, (unsigned long long) n_writes, bytes_evicted/1048576.0,
+                     stall_s, write_s, resident_bytes()/1048576.0);
++            if (reuse_hit + reuse_miss > 0) {
++                LLAMA_LOG_INFO("kvswap_dio: reuse buffer hit=%llu miss=%llu hit_rate=%.4f\n", (unsigned long long) reuse_hit,
++                        (unsigned long long) reuse_miss, (double) reuse_hit/(reuse_hit + reuse_miss));
++            }
+         }
+         if (base) {
+             munmap(base, size);
+diff --git a/src/llama-kvswap.h b/src/llama-kvswap.h
+index 4853cda2d..c23ebd28e 100644
+--- a/src/llama-kvswap.h
++++ b/src/llama-kvswap.h
+@@ -52,6 +52,7 @@ struct llama_kvswap_cfg {
+     bool     pred_same  = false;
+     bool     pred_eval  = false;
+     uint32_t pred_exact = 2;        // layers [0, pred_exact) choose from their own input (no look-ahead)
++    uint32_t reuse      = 0;        // direct I/O reuse buffer: old groups kept in RAM per layer (0 = evict after use)
+ 
+     static const llama_kvswap_cfg & get() {
+         static const llama_kvswap_cfg cfg = [] {
+@@ -80,6 +81,7 @@ struct llama_kvswap_cfg {
+             c.pred_same   = geti("LLAMA_KV_PRED_SAME", 0) != 0;
+             c.pred_eval   = geti("LLAMA_KV_PRED_EVAL", 0) != 0;
+             c.pred_exact  = std::max<uint32_t>(1, geti("LLAMA_KV_PRED_EXACT", 2));
++            c.reuse       = geti("LLAMA_KV_REUSE", 0);
+             return c;
+         }();
+         return cfg;

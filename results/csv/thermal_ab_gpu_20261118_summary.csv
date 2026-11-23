@@ -1,0 +1,10 @@
+config,n,kv,mhz,gpu_mhz_mean,tpot_ms,vs_naive_tpot,prefill_s,vs_naive_ttft,total_s,vs_naive_total,switch_error_s,dT_ss,heat_area_per_tok,heat_area_min,heat_area_max,vs_naive_heat,peak_c,max_cooling_state,quality,tail_complete,window_ok,verdict
+gnaive,2,ram,gpu default / a720 default,488.8,54.89,1,93.18,1,148,1,,11.2,1.712,1.67,1.754,1,49,0,1,1,1,baseline
+g350_cdef,2,ram,gpu 350 / a720 default,281.1,143.5,2.614,246.4,2.644,389.7,2.633,,7.012,2.469,2.352,2.586,1.442,45,0,1,1,1,WORSE (more heat)
+g350_c800,2,ram,gpu 350 / a720 800,293.4,143.7,2.617,246,2.64,389.5,2.632,,7.464,2.55,2.482,2.618,1.489,46,0,1,1,1,WORSE (more heat)
+g600_cdef,2,ram,gpu 600 / a720 default,435,86.24,1.571,146.8,1.575,232.9,1.574,,8.964,1.935,1.885,1.985,1.131,47,0,1,1,1,WORSE (more heat)
+g600_c800,2,ram,gpu 600 / a720 800,434.6,86.33,1.573,147.3,1.581,233.6,1.578,,9.036,2.003,1.96,2.045,1.17,47,0,1,1,1,WORSE (more heat)
+g800_cdef,2,ram,gpu 800 / a720 default,543,66.06,1.204,112.7,1.209,178.7,1.207,,10.36,1.862,1.732,1.992,1.088,47,0,1,1,1,WORSE (more heat)
+g800_c800,2,ram,gpu 800 / a720 800,544.3,66.14,1.205,113.1,1.214,179.2,1.211,,10.81,1.88,1.836,1.924,1.098,48,0,1,1,1,WORSE (more heat)
+g1000_cdef,2,ram,gpu 1000 / a720 default,637.9,54.68,0.9963,93.21,1,147.8,0.9988,,11.26,1.697,1.599,1.794,0.991,48,0,1,1,1,no clear gain (within noise)
+g1000_c800,2,ram,gpu 1000 / a720 800,540.7,54.72,0.9969,92.82,0.9961,147.5,0.9964,,11.67,1.818,1.717,1.92,1.062,49,0,1,1,1,WORSE (more heat)
